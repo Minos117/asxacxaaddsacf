@@ -1,23 +1,24 @@
 # ZAIA PDF - PDF annotator (PySide6 + PyMuPDF). Adds ink/highlight/text on top of pages.
-import sys, os, re, json, time, shutil, hashlib, threading, urllib.request, urllib.parse
+import sys, os, re, json, time, shutil, hashlib, tempfile, threading, urllib.request, urllib.parse
 from pathlib import Path
 import pymupdf as fitz
-from PySide6.QtCore import (Qt, QPointF, QRectF, QSizeF, QMarginsF, QTimer, QBuffer, QIODevice,
+from PySide6.QtCore import (Qt, QPointF, QRectF, QSizeF, QSize, QMarginsF, QTimer, QBuffer, QIODevice,
                             Signal, QObject, QSettings)
 from PySide6.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPalette,
                            QPen, QPixmap, QPageSize, QPageLayout, QPdfWriter, QIcon, QKeySequence,
-                           QTransform, QTextCursor, QTextBlockFormat)
+                           QTransform, QTextCursor, QTextBlockFormat, QPolygonF, QIntValidator)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsItem,
                                QGraphicsRectItem, QGraphicsPixmapItem, QGraphicsPathItem,
-                               QGraphicsTextItem, QPushButton, QColorDialog, QSpinBox,
+                               QGraphicsTextItem, QPushButton, QColorDialog,
                                QFontComboBox, QLabel, QFileDialog, QMessageBox, QInputDialog,
-                               QLineEdit, QToolBar, QToolButton, QFrame, QVBoxLayout, QHBoxLayout,
-                               QWidget, QStackedWidget, QButtonGroup, QComboBox)
+                               QLineEdit, QToolButton, QFrame, QVBoxLayout, QHBoxLayout,
+                               QWidget, QStackedWidget, QButtonGroup, QComboBox, QTabBar, QMenu, QGridLayout,
+                               QWidgetAction)
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QAbstractPrintDialog
 
-APP_VER = "0.9.0"
+APP_VER = "0.9.1"
 APP_NAME = "ZAIA PDF"
-UPDATE_URL = "https://raw.githubusercontent.com/YOUR_USER/zaia-pdf/main/update.json"
+UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
 GAP = 16
 
@@ -560,205 +561,475 @@ class Bus(QObject):
     found = Signal(str, bool)
 
 
-class ColorBtn(QPushButton):
+# ---------------------------------------------------------------- Office-style UI
+def _poly(p, pts, close=True, fill=None):
+    pg = QPolygonF([QPointF(x, y) for x, y in pts])
+    if fill is not None:
+        p.setBrush(fill)
+    p.drawPolygon(pg) if close else p.drawPolyline(pg)
+    p.setBrush(Qt.NoBrush)
+
+
+def _undo(p, c):
+    _poly(p, [(13, 6), (7, 12), (13, 18)], False)
+    path = QPainterPath(QPointF(7, 12))
+    path.lineTo(19, 12)
+    path.cubicTo(27, 12, 27, 26, 19, 26)
+    path.lineTo(11, 26)
+    p.drawPath(path)
+
+
+def _redo(p, c):
+    p.save()
+    p.translate(32, 0)
+    p.scale(-1, 1)
+    _undo(p, c)
+    p.restore()
+
+
+def _zoom(plus):
+    def f(p, c):
+        p.drawEllipse(QPointF(14, 14), 9, 9)
+        p.drawLine(21, 21, 28, 28)
+        p.drawLine(10, 14, 18, 14)
+        if plus:
+            p.drawLine(14, 10, 14, 18)
+    return f
+
+
+ICONS = {
+    "open": lambda p, c: _poly(p, [(3, 8), (12, 8), (15, 11), (28, 11), (28, 26), (3, 26)]),
+    "save": lambda p, c: (p.drawRoundedRect(QRectF(5, 5, 22, 22), 2, 2), p.drawRect(QRectF(10, 5, 11, 7)),
+                          p.drawRect(QRectF(9, 18, 14, 9))),
+    "print": lambda p, c: (p.drawRect(QRectF(4, 11, 24, 12)), p.drawRect(QRectF(9, 4, 14, 7)),
+                           p.drawRect(QRectF(9, 18, 14, 9))),
+    "undo": _undo, "redo": _redo,
+    "select": lambda p, c: _poly(p, [(8, 4), (8, 25), (13, 20), (17, 28), (20, 27), (16, 19), (23, 19)], True, c),
+    "pen": lambda p, c: (_poly(p, [(5, 27), (7, 19), (21, 5), (27, 11), (13, 25)]), p.drawLine(19, 7, 25, 13)),
+    "marker": lambda p, c: (_poly(p, [(10, 17), (20, 6), (27, 13), (17, 24)]), p.drawLine(4, 28, 15, 28)),
+    "eraser": lambda p, c: (_poly(p, [(5, 19), (17, 6), (26, 15), (14, 28)]), p.drawLine(11, 12, 20, 21),
+                            p.drawLine(14, 28, 28, 28)),
+    "text": lambda p, c: (p.drawLine(7, 7, 25, 7), p.drawLine(16, 7, 16, 26), p.drawLine(12, 26, 20, 26)),
+    "zoomout": _zoom(False), "zoomin": _zoom(True),
+    "fit": lambda p, c: (p.drawLine(4, 6, 4, 26), p.drawLine(28, 6, 28, 26), p.drawLine(8, 16, 24, 16),
+                         _poly(p, [(12, 12), (8, 16), (12, 20)], False), _poly(p, [(20, 12), (24, 16), (20, 20)], False)),
+    "update": lambda p, c: (p.drawLine(16, 26, 16, 8), _poly(p, [(9, 14), (16, 7), (23, 14)], False),
+                            p.drawLine(6, 29, 26, 29)),
+    "info": lambda p, c: (p.drawEllipse(QPointF(16, 16), 12, 12), p.drawLine(16, 14, 16, 22),
+                          p.drawEllipse(QPointF(16, 10), 0.6, 0.6)),
+    "lines": lambda p, c: (p.drawLine(13, 7, 28, 7), p.drawLine(13, 16, 28, 16), p.drawLine(13, 25, 28, 25),
+                           p.drawLine(6, 6, 6, 26), _poly(p, [(3, 9), (6, 5), (9, 9)], False),
+                           _poly(p, [(3, 23), (6, 27), (9, 23)], False)),
+}
+
+
+def ico(kind):
+    """crisp vector icon: light on dark, dark when the button is checked (green)"""
+    def draw(color, a=1.0):
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(2, 2)
+        p.setPen(QPen(QColor(color), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        ICONS[kind](p, QColor(color))
+        p.end()
+        pm.setDevicePixelRatio(2)
+        return pm
+    i = QIcon()
+    i.addPixmap(draw("#e5e7eb"), QIcon.Normal, QIcon.Off)
+    i.addPixmap(draw("#0b0d0e"), QIcon.Normal, QIcon.On)
+    i.addPixmap(draw("#6b7280"), QIcon.Disabled, QIcon.Off)
+    return i
+
+
+PALETTE = ["#000000", "#404040", "#7f7f7f", "#bfbfbf", "#ffffff", "#8d6e63",
+           "#ff0000", "#ff9800", "#ffeb3b", "#22C55E", "#166534", "#00bcd4",
+           "#1e66f5", "#7c3aed", "#ec4899", "#f87171", "#fde68a", "#86efac"]
+
+
+class ColorDrop(QToolButton):
+    """Word-style colour button: swatch + dropdown palette + 'more colours'"""
     changed = Signal(QColor)
 
-    def __init__(self, color, tip):
+    def __init__(self, title, color):
         super().__init__()
         self.c = QColor(color)
-        self.setFixedSize(30, 26)
-        self.setToolTip(tip)
-        self._paint()
-        self.clicked.connect(self._pick)
+        self.setText(title)
+        self.setToolTip(title)
+        self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setIconSize(QSize(34, 22))
+        self._icon()
+        m = QMenu(self)
+        w = QWidget()
+        g = QGridLayout(w)
+        g.setContentsMargins(8, 8, 8, 4)
+        g.setSpacing(5)
+        for i, col in enumerate(PALETTE):
+            b = QToolButton()
+            b.setFixedSize(28, 28)
+            b.setStyleSheet("QToolButton{min-width:0;min-height:0;padding:0;background:%s;"
+                            "border:1px solid #6b7280;border-radius:4px}QToolButton:hover{border:2px solid #22C55E}" % col)
+            b.clicked.connect(lambda _=False, c=col: self._pick(c, m))
+            g.addWidget(b, i // 6, i % 6)
+        wa = QWidgetAction(m)
+        wa.setDefaultWidget(w)
+        m.addAction(wa)
+        m.addAction("สีอื่น…", self._more)
+        self.setMenu(m)
+
+    def _icon(self):
+        pm = QPixmap(34, 22)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setBrush(self.c)
+        p.setPen(QPen(QColor("#9ca3af"), 1.5))
+        p.drawRoundedRect(QRectF(1, 1, 32, 20), 4, 4)
+        p.end()
+        self.setIcon(QIcon(pm))
 
     def set_color(self, c):
         self.c = QColor(c)
-        self._paint()
+        self._icon()
 
-    def _paint(self):
-        self.setStyleSheet("background:%s;border:2px solid #9ca3af;border-radius:4px;" % self.c.name())
+    def _pick(self, col, menu):
+        menu.close()
+        self.set_color(col)
+        self.changed.emit(self.c)
 
-    def _pick(self):
+    def _more(self):
         c = QColorDialog.getColor(self.c, self, "เลือกสี")
         if c.isValid():
-            self.c = c
-            self._paint()
+            self.set_color(c)
             self.changed.emit(c)
+
+
+class NumCombo(QComboBox):
+    """editable dropdown of presets: pick one or type any number"""
+    valueChanged = Signal(int)
+
+    def __init__(self, value, presets, lo, hi, width=84):
+        super().__init__()
+        self.lo, self.hi, self._last = lo, hi, value
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        self.setValidator(QIntValidator(lo, hi, self))
+        self.setFixedWidth(width)
+        self.setMaxVisibleItems(12)
+        for v in presets:
+            self.addItem(str(v))
+        self.setEditText(str(value))
+        self.activated.connect(lambda _: self._emit())
+        self.lineEdit().editingFinished.connect(self._emit)
+
+    def value(self):
+        try:
+            return min(self.hi, max(self.lo, int(self.currentText())))
+        except ValueError:
+            return self._last
+
+    def setValue(self, v):
+        self._last = int(v)
+        self.setEditText(str(int(v)))
+
+    def _emit(self):
+        v = self.value()
+        self._last = v
+        self.setEditText(str(v))
+        self.valueChanged.emit(v)
+
+    def wheelEvent(self, e):  # no accidental changes while scrolling the ribbon
+        e.accept() if self.hasFocus() else e.ignore()
+
+
+def arrow_png():
+    pm = QPixmap(12, 8)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor("#e5e7eb"))
+    p.setPen(Qt.NoPen)
+    p.drawPolygon(QPolygonF([QPointF(1, 1), QPointF(11, 1), QPointF(6, 7)]))
+    p.end()
+    f = os.path.join(tempfile.gettempdir(), "zaia_arrow.png")
+    pm.save(f)
+    return f.replace("\\", "/")
 
 
 QSS = """
 QMainWindow{background:#1b1d1f}
-QToolBar{background:#16181a;border:0;border-bottom:2px solid #22C55E;padding:3px}
-QFrame#grp{border-right:1px solid #3a3f45}
-QLabel{color:#9ca3af}
-QLabel#cap{color:#22C55E;font-size:10px;font-weight:bold}
-QToolButton{color:#e5e7eb;background:#2b2f33;border:1px solid #3a3f45;border-radius:6px;
-  min-width:54px;min-height:46px;padding:2px 6px;font-size:12px}
-QToolButton:hover{background:#383d42}
+QLabel{color:#cbd5e1;font-size:12px}
+QLabel#cap{color:#22C55E;font-size:11px;font-weight:bold}
+QTabBar{background:#16181a}
+QTabBar::tab{background:transparent;color:#cbd5e1;padding:8px 22px;font-size:14px;border:0;border-bottom:3px solid transparent}
+QTabBar::tab:hover{background:#2b2f33}
+QTabBar::tab:selected{color:#22C55E;font-weight:bold;border-bottom:3px solid #22C55E}
+QWidget#panel{background:#202326;border-top:1px solid #3a3f45;border-bottom:2px solid #22C55E}
+QFrame#grp{border:0;border-right:1px solid #566170}
+QFrame#tools{background:#16181a;border-right:1px solid #3a3f45}
+QToolButton{color:#e5e7eb;background:#2b2f33;border:1px solid #3a3f45;border-radius:7px;
+  min-width:66px;min-height:68px;padding:3px 6px;font-size:12px}
+QToolButton:hover{background:#383d42;border-color:#22C55E}
 QToolButton:checked{background:#22C55E;color:#0b0d0e;font-weight:bold;border-color:#22C55E}
-QToolButton#mini{min-width:28px;min-height:26px;padding:0 4px;font-size:13px}
-QSpinBox,QFontComboBox{background:#232629;color:#e5e7eb;border:1px solid #4b5563;border-radius:4px;padding:2px;min-height:24px}
+QToolButton:disabled{color:#6b7280}
+QToolButton::menu-indicator{subcontrol-position:bottom right;subcontrol-origin:padding;right:4px;bottom:3px}
+QToolButton#mini{min-width:38px;min-height:30px;padding:0;font-size:15px}
+QToolButton#tool{min-width:78px;min-height:72px;font-size:12px}
+QComboBox{background:#2b2f33;color:#e5e7eb;border:1px solid #4b5563;border-radius:6px;padding:2px 8px;
+  min-height:28px;font-size:13px;combobox-popup:0}
+QComboBox:hover,QComboBox:focus{border-color:#22C55E}
+QComboBox::drop-down{border:0;width:26px}
+QComboBox::down-arrow{image:url(%ARROW%);width:12px;height:8px}
+QComboBox QLineEdit{background:transparent;border:0;color:#e5e7eb;selection-background-color:#22C55E;selection-color:#0b0d0e}
+QComboBox QAbstractItemView{background:#232629;color:#e5e7eb;border:1px solid #22C55E;
+  selection-background-color:#22C55E;selection-color:#0b0d0e;outline:0}
+QComboBox QAbstractItemView::item{min-height:30px;padding-left:10px}
+QMenu{background:#232629;color:#e5e7eb;border:1px solid #3a3f45;padding:4px}
+QMenu::item{padding:7px 26px;min-height:22px;font-size:13px}
+QMenu::item:selected{background:#22C55E;color:#0b0d0e}
+QMenu::separator{height:1px;background:#3a3f45;margin:4px 8px}
 QStatusBar{background:#16181a;color:#9ca3af}
-QPushButton#upd{background:#22C55E;color:#000;border:0;border-radius:4px;padding:2px 10px;font-weight:bold}
-QToolTip{background:#232629;color:#e5e7eb;border:1px solid #22C55E}
+QPushButton#upd{background:#22C55E;color:#000;border:0;border-radius:4px;padding:3px 12px;font-weight:bold}
+QToolTip{background:#232629;color:#e5e7eb;border:1px solid #22C55E;padding:4px}
+QScrollBar:vertical{background:#1b1d1f;width:14px}
+QScrollBar::handle:vertical{background:#4b5563;border-radius:6px;min-height:30px}
+QScrollBar::add-line,QScrollBar::sub-line{height:0}
 """
 
 
 class Group(QFrame):
-    """one titled toolbar category"""
-    def __init__(self, title, *widgets):
+    """one titled ribbon category: controls on top, caption below"""
+    def __init__(self, title, *cols):
         super().__init__()
         self.setObjectName("grp")
+        self.setFrameShape(QFrame.StyledPanel)  # needed for the QSS border to be drawn
         v = QVBoxLayout(self)
-        v.setContentsMargins(8, 2, 8, 2)
+        v.setContentsMargins(10, 6, 10, 2)
         v.setSpacing(2)
         row = QHBoxLayout()
-        row.setSpacing(4)
-        v.addLayout(row)
-        for w in widgets:
-            row.addWidget(w)
+        row.setSpacing(8)
+        for c in cols:
+            row.addWidget(c, 0, Qt.AlignTop)
+        v.addLayout(row, 1)
         cap = QLabel(title)
         cap.setObjectName("cap")
         cap.setAlignment(Qt.AlignCenter)
         v.addWidget(cap)
 
 
-def hbox(*widgets):
+def rows(*rs):
+    """vertical stack of rows; a row is a widget or a list of widgets"""
     w = QWidget()
-    h = QHBoxLayout(w)
-    h.setContentsMargins(0, 0, 0, 0)
-    for x in widgets:
-        h.addWidget(x)
-    h.addStretch()
+    v = QVBoxLayout(w)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(5)
+    for r in rs:
+        if isinstance(r, (list, tuple)):
+            h = QHBoxLayout()
+            h.setSpacing(6)
+            for x in r:
+                h.addWidget(x)
+            v.addLayout(h)
+        else:
+            v.addWidget(r)
+    v.addStretch()
     return w
+
+
+def big(text, kind, fn, key=None, checkable=False, name=None):
+    b = QToolButton()
+    b.setText(text)
+    b.setIcon(ico(kind))
+    b.setIconSize(QSize(30, 30))
+    b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+    b.setToolTip(text.replace("\n", " ") + (" (%s)" % key if key else ""))
+    b.setCheckable(checkable)
+    if name:
+        b.setObjectName(name)
+    if key:
+        b.setShortcut(QKeySequence(key))
+    b.clicked.connect(fn)
+    return b
+
+
+def mini(text, fn, italic=False, underline=False):
+    b = QToolButton()
+    b.setObjectName("mini")
+    b.setText(text)
+    b.setCheckable(True)
+    f = b.font()
+    f.setItalic(italic)
+    f.setUnderline(underline)
+    f.setBold(not (italic or underline))
+    b.setFont(f)
+    b.clicked.connect(fn)
+    return b
 
 
 class Main(QMainWindow):
     TOOLS = ["select", "pen", "highlight", "eraser", "text"]
+    LINES = [("1.0", 100), ("1.15", 115), ("1.5", 150), ("2.0", 200), ("2.5", 250), ("3.0", 300)]
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1200, 800)
+        self.resize(1280, 820)
+        self.setMinimumWidth(1100)
         self.setAcceptDrops(True)
-        self.setStyleSheet(QSS)
+        self.setStyleSheet(QSS.replace("%ARROW%", arrow_png()))
         self.cfg = QSettings("ZAIA", "ZAIA PDF")
         self.path = ""
         self.dirty = False
+        self.lh = 100
         self.cv = Canvas()
-        self.setCentralWidget(self.cv)
         self.cv.changed.connect(lambda: setattr(self, "dirty", True))
         self.bus = Bus()
         self.bus.found.connect(self.on_found)
 
-        def btn(text, fn, key=None, checkable=False, mini=False):
-            b = QToolButton()
-            b.setText(text)
-            b.setToolTip(text.replace("\n", " ") + (" (%s)" % key if key else ""))
-            b.setCheckable(checkable)
-            if mini:
-                b.setObjectName("mini")
-            if key:
-                b.setShortcut(QKeySequence(key))
-            b.clicked.connect(fn)
-            return b
-
-        # tools (exclusive, active one turns green)
+        # ---- left tool palette (always visible)
+        tools = QFrame()
+        tools.setObjectName("tools")
+        tv = QVBoxLayout(tools)
+        tv.setContentsMargins(8, 10, 8, 10)
+        tv.setSpacing(8)
+        cap = QLabel("เครื่องมือ")
+        cap.setObjectName("cap")
+        cap.setAlignment(Qt.AlignCenter)
+        tv.addWidget(cap)
         grp = QButtonGroup(self)
-        tools = []
-        for i, (k, txt) in enumerate([("select", "↖\nเลือก/ย้าย"), ("pen", "✎\nปากกา"),
-                                      ("highlight", "▰\nไฮไลท์"), ("eraser", "⌫\nยางลบ"),
-                                      ("text", "T\nข้อความ")]):
-            b = btn(txt, lambda _=False, k=k: self.pick(k), "Ctrl+%d" % (i + 1), True)
+        self.tool_btns = []
+        for i, (k, txt, kind) in enumerate([("select", "เลือก/ย้าย", "select"), ("pen", "ปากกา", "pen"),
+                                            ("highlight", "ไฮไลท์", "marker"), ("eraser", "ยางลบ", "eraser"),
+                                            ("text", "ข้อความ", "text")]):
+            b = big(txt, kind, lambda _=False, k=k: self.pick(k), "Ctrl+%d" % (i + 1), True, "tool")
             grp.addButton(b)
-            tools.append(b)
-        tools[0].setChecked(True)
-        self.tool_btns = tools
+            tv.addWidget(b)
+            self.tool_btns.append(b)
+        tv.addStretch()
+        self.tool_btns[0].setChecked(True)
+        cw = QWidget()
+        h = QHBoxLayout(cw)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        h.addWidget(tools)
+        h.addWidget(self.cv, 1)
+        self.setCentralWidget(cw)
 
-        # per-tool options
-        self.cb_pen = ColorBtn(self.cv.pen_color, "สีปากกา")
-        self.cb_txt = ColorBtn(self.cv.pen_color, "สีข้อความ")
-        self.cb_hl = ColorBtn(self.cv.hl_color, "สีไฮไลท์")
+        # ---- shared option widgets
+        self.cb_pen = ColorDrop("สีปากกา", self.cv.pen_color)
+        self.cb_txt = ColorDrop("สีข้อความ", self.cv.pen_color)
+        self.cb_hl = ColorDrop("สีไฮไลท์", self.cv.hl_color)
         self.cb_pen.changed.connect(self.set_pen_color)
         self.cb_txt.changed.connect(self.set_pen_color)
         self.cb_hl.changed.connect(lambda c: setattr(self.cv, "hl_color", c))
-        sw = QSpinBox()
-        sw.setRange(1, 100)
-        sw.setValue(self.cv.width)
-        sw.valueChanged.connect(lambda v: setattr(self.cv, "width", v))
+        self.pw = NumCombo(self.cv.width, [1, 2, 3, 4, 6, 8, 12, 16, 24, 36, 50, 72, 100], 1, 100)
+        self.pw.valueChanged.connect(lambda v: setattr(self.cv, "width", v))
         self.fc = QFontComboBox()
+        self.fc.setFixedWidth(210)
         self.fc.setCurrentFont(QFont("Tahoma"))
         self.fc.currentFontChanged.connect(self.font_changed)
-        self.fs = QSpinBox()
-        self.fs.setRange(4, 400)
-        self.fs.setValue(16)
-        self.fs.valueChanged.connect(self.font_changed)
-        self.fw = QComboBox()
-        for label, w in [("บางมาก", QFont.Thin), ("บาง", QFont.Light), ("ปกติ", QFont.Normal),
-                         ("กลาง", QFont.Medium), ("กึ่งหนา", QFont.DemiBold), ("หนา", QFont.Bold),
-                         ("หนามาก", QFont.Black)]:
-            self.fw.addItem(label, w)
-        self.fw.setCurrentIndex(2)
-        self.fw.currentIndexChanged.connect(self.font_changed)
-        self.fi = btn("I", self.font_changed, None, True, True)
-        self.fu = btn("U", self.font_changed, None, True, True)
+        self.fs = NumCombo(16, [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 60, 72, 96], 4, 400)
+        self.fw = NumCombo(100, [25, 50, 75, 100, 125, 150, 175, 200, 225], 25, 250)   # weight %  (100 = regular)
+        self.fls = NumCombo(100, [50, 75, 90, 100, 110, 125, 150, 200, 300], 20, 500)  # letter spacing %
+        self.fx = NumCombo(100, [50, 70, 80, 90, 100, 110, 120, 150, 200], 30, 300)    # width / compress %
+        for c in (self.fs, self.fw, self.fls, self.fx):
+            c.valueChanged.connect(self.font_changed)
+        self.fi = mini("I", self.font_changed, italic=True)
+        self.fu = mini("U", self.font_changed, underline=True)
+        self.ls_btn = QToolButton()
+        self.ls_btn.setIcon(ico("lines"))
+        self.ls_btn.setIconSize(QSize(30, 30))
+        self.ls_btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.ls_btn.setPopupMode(QToolButton.InstantPopup)
+        self.ls_btn.setToolTip("ระยะห่างระหว่างบรรทัด (เหมือน Word)")
+        lm = QMenu(self.ls_btn)
+        self.ls_acts = []
+        for label, pct in self.LINES:
+            self.ls_acts.append((lm.addAction(label, lambda p=pct: self.set_line(p)), label, pct))
+        lm.addSeparator()
+        lm.addAction("ระยะบรรทัดแบบกำหนดเอง…", self.line_custom)
+        self.ls_btn.setMenu(lm)
+        self.set_line(100, False)
+        hl_sw = []
+        for col in ("#ffeb3b", "#86efac", "#67e8f9", "#f9a8d4", "#fdba74"):
+            b = QToolButton()
+            b.setFixedSize(30, 30)
+            b.setToolTip("ไฮไลท์สีนี้")
+            b.setStyleSheet("QToolButton{min-width:0;min-height:0;padding:0;background:%s;border:1px solid #6b7280;"
+                            "border-radius:5px}QToolButton:hover{border:2px solid #22C55E}" % col)
+            b.clicked.connect(lambda _=False, c=col: (self.cb_hl.set_color(c), setattr(self.cv, "hl_color", QColor(c))))
+            hl_sw.append(b)
 
-        def pct(v, lo, hi):
-            sp = QSpinBox()
-            sp.setRange(lo, hi)
-            sp.setValue(v)
-            sp.setSuffix(" %")
-            sp.valueChanged.connect(self.font_changed)
-            return sp
-        self.fls = pct(100, 20, 500)   # letter spacing
-        self.fx = pct(100, 30, 300)    # horizontal scale (compress / expand)
-        self.fl = pct(100, 50, 400)    # line height
-        self.fls.setToolTip("ระยะห่างตัวอักษร (100% = ปกติ)")
-        self.fx.setToolTip("บีบ/ขยายความกว้างตัวอักษร (100% = ปกติ)")
-        self.fl.setToolTip("ระยะห่างระหว่างบรรทัด (100% = ปกติ)")
-        self.stack = QStackedWidget()  # order = TOOLS
-        for ws in ([QLabel("คลิกเลือก • ลากย้าย • Delete = ลบ • ดับเบิลคลิกข้อความ = แก้")],
-                   [QLabel("สี"), self.cb_pen, QLabel("ความหนา"), sw],
-                   [QLabel("สีไฮไลท์"), self.cb_hl, QLabel("ลากเป็นกรอบทับข้อความ")],
-                   [QLabel("คลิก/ลากทับสิ่งที่เพิ่มไว้เพื่อลบ (ไม่แตะเนื้อหา PDF เดิม)")],
-                   None):
-            if ws is None:  # text page: 2 rows
-                pg = QWidget()
-                v = QVBoxLayout(pg)
-                v.setContentsMargins(0, 0, 0, 0)
-                v.setSpacing(3)
-                v.addWidget(hbox(QLabel("สี"), self.cb_txt, QLabel("ฟอนต์"), self.fc, self.fs,
-                                 QLabel("น้ำหนัก"), self.fw, self.fi, self.fu))
-                v.addWidget(hbox(QLabel("ห่างอักษร"), self.fls, QLabel("กว้างอักษร"), self.fx,
-                                 QLabel("ระยะบรรทัด"), self.fl, QLabel("ลากจุดเขียวขวากล่อง = กำหนดความกว้าง/ตัดบรรทัด (ดับเบิลคลิก = อัตโนมัติ)")))
-                self.stack.addWidget(pg)
-            else:
-                self.stack.addWidget(hbox(*ws))
-        self.cv.sc.selectionChanged.connect(self.update_opts)
+        def lab(t):
+            return QLabel(t)
 
-        ribbon = QWidget()
-        h = QHBoxLayout(ribbon)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(0)
-        for g in (Group("ไฟล์", btn("📂\nเปิด", self.open_dialog, "Ctrl+O"),
-                        btn("💾\nบันทึกเป็น", self.save_as, "Ctrl+S"),
-                        btn("🖨\nพิมพ์", self.print_pdf, "Ctrl+P")),
-                  Group("แก้ไข", btn("↶\nย้อนกลับ", self.cv.do_undo, "Ctrl+Z"),
-                        btn("↷\nทำซ้ำ", self.cv.do_redo, "Ctrl+Y")),
-                  Group("เครื่องมือ", *tools),
-                  Group("ตั้งค่าเครื่องมือ", self.stack),
-                  Group("มุมมอง", btn("−\nย่อ", lambda: self.cv.set_zoom(self.cv.zoom / 1.2), "Ctrl+-"),
-                        btn("+\nขยาย", lambda: self.cv.set_zoom(self.cv.zoom * 1.2), "Ctrl+="),
-                        btn("⤢\nพอดีกว้าง", self.cv.fit_width, "Ctrl+0")),
-                  Group("ช่วยเหลือ", btn("⬆\nอัปเดต", self.check_update),
-                        btn("ℹ\nเกี่ยวกับ", lambda: QMessageBox.information(
+        # ---- ribbon tabs
+        home = QWidget()
+        home.setObjectName("panel")
+        hh = QHBoxLayout(home)
+        hh.setContentsMargins(6, 0, 6, 0)
+        hh.setSpacing(0)
+        for g in (Group("ไฟล์", big("เปิด", "open", self.open_dialog, "Ctrl+O"),
+                        big("บันทึกเป็น", "save", self.save_as, "Ctrl+S"),
+                        big("พิมพ์", "print", self.print_pdf, "Ctrl+P")),
+                  Group("แก้ไข", big("ย้อนกลับ", "undo", self.cv.do_undo, "Ctrl+Z"),
+                        big("ทำซ้ำ", "redo", self.cv.do_redo, "Ctrl+Y")),
+                  Group("มุมมอง", big("ย่อ", "zoomout", lambda: self.cv.set_zoom(self.cv.zoom / 1.2), "Ctrl+-"),
+                        big("ขยาย", "zoomin", lambda: self.cv.set_zoom(self.cv.zoom * 1.2), "Ctrl+="),
+                        big("พอดีกว้าง", "fit", self.cv.fit_width, "Ctrl+0")),
+                  Group("ช่วยเหลือ", big("อัปเดต", "update", self.check_update),
+                        big("เกี่ยวกับ", "info", lambda: QMessageBox.information(
                             self, APP_NAME, "%s %s (Beta)\nเพิ่มปากกา/ไฮไลท์/ข้อความทับบน PDF\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
-            h.addWidget(g)
-        h.addStretch()
-        bar = QToolBar()
-        bar.setMovable(False)
-        bar.addWidget(ribbon)
-        self.addToolBar(bar)
+            hh.addWidget(g)
+        hh.addStretch()
+
+        draw = QWidget()
+        draw.setObjectName("panel")
+        dh = QHBoxLayout(draw)
+        dh.setContentsMargins(6, 0, 6, 0)
+        dh.setSpacing(0)
+        for g in (Group("ปากกา", self.cb_pen, rows([lab("ความหนา")], [self.pw, lab("pt")])),
+                  Group("ไฮไลท์", self.cb_hl, rows([lab("สีด่วน")], hl_sw[:3], hl_sw[3:])),
+                  Group("ยางลบ", rows([lab("เลือกเครื่องมือ \"ยางลบ\" แล้วคลิกหรือลาก")],
+                                      [lab("ทับสิ่งที่เพิ่มไว้เพื่อลบ")], [lab("(ไม่แตะเนื้อหา PDF เดิม)")]))):
+            dh.addWidget(g)
+        dh.addStretch()
+
+        txt = QWidget()
+        txt.setObjectName("panel")
+        th = QHBoxLayout(txt)
+        th.setContentsMargins(6, 0, 6, 0)
+        th.setSpacing(0)
+        for g in (Group("ฟอนต์", rows([self.fc, self.fs], [self.fi, self.fu])),
+                  Group("สี", self.cb_txt),
+                  Group("ตัวอักษร (%)", rows([lab("ความหนา"), self.fw], [lab("ระยะห่าง"), self.fls],
+                                              [lab("ความกว้าง"), self.fx])),
+                  Group("ย่อหน้า", self.ls_btn),
+                  Group("กล่องข้อความ", big("กว้างอัตโนมัติ", "fit", self.reset_width),
+                        rows([lab("ลากจุดเขียวที่ขอบขวา")], [lab("ของกล่อง เพื่อกำหนด")], [lab("ความกว้าง/ตัดบรรทัด")]))):
+            th.addWidget(g)
+        th.addStretch()
+
+        self.pages = QStackedWidget()
+        self.pages.setFixedHeight(146)
+        for p in (home, draw, txt):
+            self.pages.addWidget(p)
+        self.tabs = QTabBar()
+        self.tabs.setDrawBase(False)
+        self.tabs.setExpanding(False)
+        for n in ("หน้าแรก", "วาด", "ข้อความ"):
+            self.tabs.addTab(n)
+        self.tabs.currentChanged.connect(self.pages.setCurrentIndex)
+        ribbon = QWidget()
+        rv = QVBoxLayout(ribbon)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+        rv.addWidget(self.tabs)
+        rv.addWidget(self.pages)
+        self.setMenuWidget(ribbon)
+        self.cv.sc.selectionChanged.connect(self.update_opts)
 
         self.pl = QLabel("")
         self.statusBar().addPermanentWidget(self.pl)
@@ -774,17 +1045,38 @@ class Main(QMainWindow):
         self.tool_btns[self.TOOLS.index(k)].setChecked(True)
         self.cv.set_tool(k)
         self.update_opts()
+        tab = {"pen": 1, "highlight": 1, "text": 2}.get(k)  # ribbon follows the tool
+        if tab is not None:
+            self.tabs.setCurrentIndex(tab)
 
     def update_opts(self):
-        t = self.cv.tool
         sel = [i for i in self.cv.sc.selectedItems() if isinstance(i, ZText)]
-        if t == "select" and sel:
-            t = "text"  # let user restyle a selected text box
         if len(sel) == 1:
             self.load_text_style(sel[0])
-        self.stack.setCurrentIndex(self.TOOLS.index(t))
+        if self.cv.tool == "select" and sel:
+            self.tabs.setCurrentIndex(2)  # contextual: a text box is selected
 
-    # ---- font / color
+    def reset_width(self):
+        for it in self.cv.sc.selectedItems():
+            if isinstance(it, ZText):
+                it.set_width(-1)
+
+    # ---- line spacing (Word style: 1.0 / 1.15 / 1.5 / 2.0 / 2.5 / 3.0 / custom)
+    def set_line(self, pct, apply=True):
+        self.lh = pct
+        for act, label, p in self.ls_acts:
+            act.setText(("✓  " if p == pct else "    ") + label)
+        self.ls_btn.setText("ระยะบรรทัด\n" + dict((p, l) for _, l, p in self.ls_acts).get(pct, "%.2f" % (pct / 100)))
+        if apply:
+            self.font_changed()
+
+    def line_custom(self):
+        v, ok = QInputDialog.getDouble(self, "ระยะบรรทัด", "ตัวคูณ (เช่น 1.0 = ปกติ, 1.5, 2.0):",
+                                       self.lh / 100, 0.5, 4.0, 2)
+        if ok:
+            self.set_line(int(round(v * 100)))
+
+    # ---- font / colour
     def set_pen_color(self, c):
         self.cv.pen_color = c
         self.cb_pen.set_color(c)
@@ -794,32 +1086,28 @@ class Main(QMainWindow):
     def font_changed(self, *_):
         f = QFont(self.fc.currentFont())
         f.setPointSize(self.fs.value())
-        f.setWeight(self.fw.currentData())
+        f.setWeight(QFont.Weight(min(1000, max(1, self.fw.value() * 4))))  # 100 % = 400 = regular
         f.setItalic(self.fi.isChecked())
         f.setUnderline(self.fu.isChecked())
         f.setLetterSpacing(QFont.PercentageSpacing, float(self.fls.value()))  # % of glyph width: same on screen and PDF
         self.cv.font = f
-        self.cv.tx_stretch, self.cv.tx_line = self.fx.value(), self.fl.value()
+        self.cv.tx_stretch, self.cv.tx_line = self.fx.value(), self.lh
         self.cv.apply_text_style()
 
     def load_text_style(self, it):
         """show the selected text box's own style in the controls (without applying anything)"""
         f = it.font()
-        ws = [self.fw.itemData(i) for i in range(self.fw.count())]
         wv = lambda w: getattr(w, "value", w)
-        ctrls = (self.fc, self.fs, self.fw, self.fi, self.fu, self.fls, self.fx, self.fl)
-        for c in ctrls:
-            c.blockSignals(True)
+        self.fc.blockSignals(True)
         self.fc.setCurrentFont(f)
+        self.fc.blockSignals(False)
         self.fs.setValue(max(4, f.pointSize()))
-        self.fw.setCurrentIndex(min(range(len(ws)), key=lambda i: abs(wv(ws[i]) - wv(f.weight()))))
+        self.fw.setValue(min(250, max(25, round(wv(f.weight()) / 4))))
         self.fi.setChecked(f.italic())
         self.fu.setChecked(f.underline())
         self.fls.setValue(int(f.letterSpacing()) if f.letterSpacingType() == QFont.PercentageSpacing else 100)
         self.fx.setValue(it.sx)
-        self.fl.setValue(it.lh)
-        for c in ctrls:
-            c.blockSignals(False)
+        self.set_line(it.lh, False)
         col = it.defaultTextColor()
         self.cb_pen.set_color(col)
         self.cb_txt.set_color(col)
@@ -984,6 +1272,8 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     dark_theme(app)
+    for ef in (Qt.UI_AnimateCombo, Qt.UI_AnimateMenu, Qt.UI_FadeMenu, Qt.UI_FadeTooltip):
+        app.setEffectEnabled(ef, True)  # smooth dropdowns
 
     def hook(t, v, tb):  # pythonw has no console: keep errors visible
         import traceback
