@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QWidgetAction, QSlider, QDialog, QPlainTextEdit)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 
-APP_VER = "1.1.0"
+APP_VER = "1.1.1"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -334,23 +334,39 @@ def form_font():
     return next((f for f in FORM_FONTS if f in have), QApplication.font().family())
 
 
+def pdf_color(c, default=None):
+    """PDF colour (0/1 = none, 1 value = gray, 3 = RGB, 4 = CMYK; None/[] allowed) -> QColor, or default"""
+    try:
+        v = [float(x) for x in (c or [])]
+    except (TypeError, ValueError):
+        return default
+    if len(v) == 1:
+        return QColor.fromRgbF(v[0], v[0], v[0])
+    if len(v) == 3:
+        return QColor.fromRgbF(*[min(1.0, max(0.0, x)) for x in v])
+    if len(v) == 4:
+        cc, m, y, k = [min(1.0, max(0.0, x)) for x in v]
+        return QColor.fromRgbF((1 - cc) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k))
+    return default
+
+
 def field_png(wpt, hpt, text, size, color, align, multiline, fill, border, bwidth):
     """400 dpi picture of a filled-in field (Thai shaped by Qt, independent of the PDF renderer's fonts)"""
     S = 400 / 72
     img = QImage(max(1, math.ceil(wpt * S)), max(1, math.ceil(hpt * S)), QImage.Format_ARGB32)
     img.setDotsPerMeterX(2835)  # 72 dpi: 1 pt = 1 px before the scale below
     img.setDotsPerMeterY(2835)
-    img.fill(QColor.fromRgbF(*fill) if fill else Qt.transparent)
+    img.fill(pdf_color(fill) or Qt.transparent)
     p = QPainter(img)
     p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
     p.scale(S, S)
-    if border and bwidth:
-        p.setPen(QPen(QColor.fromRgbF(*border), bwidth))
+    if pdf_color(border) and bwidth:
+        p.setPen(QPen(pdf_color(border), bwidth))
         p.drawRect(QRectF(bwidth / 2, bwidth / 2, wpt - bwidth, hpt - bwidth))
     f = QFont(form_font())
     f.setPointSizeF(size)
     p.setFont(f)
-    p.setPen(QColor.fromRgbF(*color))
+    p.setPen(pdf_color(color, QColor(0, 0, 0)))
     flags = {1: Qt.AlignHCenter, 2: Qt.AlignRight}.get(align, Qt.AlignLeft)
     flags |= (Qt.AlignTop | Qt.TextWordWrap) if multiline else Qt.AlignVCenter
     area = QRectF(2, 1, max(1, wpt - 4), max(1, hpt - 2))
@@ -379,19 +395,30 @@ def apply_value(doc, page_no, xref, value):
         w.update()
     if empty or ftype not in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
         return
-    r = w.rect
-    wpt, hpt = r.width, r.height
-    multi = bool(w.field_flags & fitz.PDF_TX_FIELD_IS_MULTILINE) and ftype == fitz.PDF_WIDGET_TYPE_TEXT
-    size = w.text_fontsize if w.text_fontsize and w.text_fontsize > 0 else (12 if multi else min(max(hpt * 0.62, 6), 16))
-    q = doc.xref_get_key(xref, "Q")
-    png = field_png(wpt, hpt, str(value), size, w.text_color or (0, 0, 0), int(q[1]) if q[0] == "int" else 0,
-                    multi, w.fill_color, w.border_color, w.border_width or 0)
-    mini = fitz.open()
-    mini.new_page(width=wpt, height=hpt).insert_image(fitz.Rect(0, 0, wpt, hpt), stream=png)
-    tmp = doc.new_page(-1, width=wpt, height=hpt)  # scratch page: turns the picture into a form XObject
-    form = tmp.show_pdf_page(tmp.rect, mini, 0)
-    doc.delete_page(len(doc) - 1)
-    doc.xref_set_key(xref, "AP", "<</N %d 0 R>>" % form)
+    n0 = len(doc)
+    try:  # a failure here must never lose the value: MuPDF's own appearance then stays
+        r = w.rect
+        wpt, hpt = r.width, r.height
+        multi = bool(w.field_flags & fitz.PDF_TX_FIELD_IS_MULTILINE) and ftype == fitz.PDF_WIDGET_TYPE_TEXT
+        size = w.text_fontsize if w.text_fontsize and w.text_fontsize > 0 else (12 if multi else min(max(hpt * 0.62, 6), 16))
+        q = doc.xref_get_key(xref, "Q")
+        png = field_png(wpt, hpt, str(value), size, w.text_color, int(q[1]) if q[0] == "int" else 0,
+                        multi, w.fill_color, w.border_color, w.border_width or 0)
+        mini = fitz.open()
+        mini.new_page(width=wpt, height=hpt).insert_image(fitz.Rect(0, 0, wpt, hpt), stream=png)
+        tmp = doc.new_page(-1, width=wpt, height=hpt)  # scratch page: turns the picture into a form XObject
+        form = tmp.show_pdf_page(tmp.rect, mini, 0)
+        doc.delete_page(len(doc) - 1)
+        doc.xref_set_key(xref, "AP", "<</N %d 0 R>>" % form)
+    except Exception as e:
+        try:
+            with open(APP_DIR / "zaia.log", "a", encoding="utf-8") as f:
+                f.write("%s  field appearance failed (xref %s): %s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), xref, type(e).__name__, e))
+        except OSError:
+            pass
+    finally:
+        while len(doc) > n0:  # never leave the scratch page behind
+            doc.delete_page(len(doc) - 1)
 
 
 class FormHit(QGraphicsRectItem):
