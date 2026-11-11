@@ -13,10 +13,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QFontComboBox, QLabel, QFileDialog, QMessageBox, QInputDialog,
                                QLineEdit, QToolButton, QFrame, QVBoxLayout, QHBoxLayout,
                                QWidget, QStackedWidget, QButtonGroup, QComboBox, QTabBar, QMenu, QGridLayout,
-                               QWidgetAction)
-from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QAbstractPrintDialog
+                               QWidgetAction, QSlider)
+from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 
-APP_VER = "0.9.1"
+APP_VER = "0.9.2"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -174,19 +174,28 @@ class ZText(QGraphicsTextItem):
         super().__init__()
         self.canvas = canvas
         self.pending = True
-        self.sx = self.lh = 100
+        self.sx = self.lh = self.wt = 100
+        self.bold_px = 0.0
+        self._outline = None
         self.setData(0, "ann")
         self.setData(1, page)
         self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsMovable)
         self.setTextInteractionFlags(Qt.NoTextInteraction)
         self.grip = Grip(self)  # child item: hidden unless selected, never exported
         self.document().contentsChanged.connect(self.place_grip)
+        self.document().contentsChanged.connect(self._dirty_outline)
 
-    def style(self, font, color, sx, lh):
-        """font (weight/spacing/size...), colour, horizontal scale %, line height %"""
+    def _dirty_outline(self):
+        self._outline = None
+
+    def style(self, font, color, sx, lh, wt=100):
+        """font (spacing/size/italic...), colour, width %, line height %, weight % (>100 = faux-bold stroke)"""
+        self.prepareGeometryChange()
         self.setFont(font)
         self.setDefaultTextColor(color)
-        self.sx, self.lh = sx, lh
+        self.sx, self.lh, self.wt = sx, lh, wt
+        self.bold_px = font.pointSizeF() * 0.03 * (wt - 100) / 50 if wt > 100 else 0.0
+        self._outline = None
         self.setTransform(QTransform.fromScale(sx / 100, 1))  # compress/expand around top-left
         c = QTextCursor(self.document())
         c.select(QTextCursor.SelectionType.Document)
@@ -199,8 +208,44 @@ class ZText(QGraphicsTextItem):
         self.setTextWidth(w)
         self.place_grip()
 
+    def boundingRect(self):
+        r = super().boundingRect()
+        b = self.bold_px
+        return r.adjusted(-b, -b, b, b) if b > 0 else r
+
+    def _glyph_outline(self):
+        """vector outline of the shaped text (Thai marks included), used for the faux-bold stroke"""
+        if self._outline is None:
+            path = QPainterPath()
+            self.document().size()  # forces layout; glyph runs are empty before it
+            blk = self.document().begin()
+            while blk.isValid():
+                lay = blk.layout()
+                for i in range(lay.lineCount()):  # per line: QTextLayout.glyphRuns() is empty for document layouts
+                    for run in lay.lineAt(i).glyphRuns():
+                        rf = run.rawFont()
+                        for idx, pos in zip(run.glyphIndexes(), run.positions()):
+                            g = rf.pathForGlyph(idx)
+                            g.translate(pos + lay.position())
+                            path.addPath(g)
+                blk = blk.next()
+            if path.isEmpty():
+                return path  # not cached: try again on the next paint
+            self._outline = path
+        return self._outline
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self.bold_px > 0:
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(QPen(self.defaultTextColor(), self.bold_px, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(self._glyph_outline())
+            painter.restore()
+
     def place_grip(self):
-        r = self.boundingRect()
+        r = super().boundingRect()
         w = self.textWidth() if self.textWidth() > 0 else r.width()
         self.grip.setPos(w, r.height() / 2)
 
@@ -236,7 +281,7 @@ class Canvas(QGraphicsView):
         super().__init__(sc)
         self.sc = sc  # keep python ref or the scene is garbage collected
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-        self.setBackgroundBrush(QColor("#2b2d30"))  # view bg, so sc.render() stays transparent
+        self.setBackgroundBrush(QColor("#cfd4da"))  # view bg, so sc.render() stays transparent
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.doc = None
         self.data = b""
@@ -248,7 +293,7 @@ class Canvas(QGraphicsView):
         self.hl_color = QColor("#FFEB3B")
         self.width = 3
         self.font = QFont("Tahoma", 16)
-        self.tx_stretch = self.tx_line = 100
+        self.tx_stretch = self.tx_line = self.tx_weight = 100
         self.undo, self.redo = [], []
         self.cur = self.start = self.pg = self.erasing = None
         self.timer = QTimer(self, singleShot=True, interval=40)
@@ -378,7 +423,7 @@ class Canvas(QGraphicsView):
                 return super().mousePressEvent(e)
             if pg:
                 t = ZText(self, pg.idx)
-                t.style(self.font, self.pen_color, self.tx_stretch, self.tx_line)
+                t.style(self.font, self.pen_color, self.tx_stretch, self.tx_line, self.tx_weight)
                 t.setPos(pos)
                 t.setZValue(10)
                 self.sc.addItem(t)
@@ -474,7 +519,7 @@ class Canvas(QGraphicsView):
         fi = self.sc.focusItem()
         for it in self.sc.selectedItems() + ([fi] if fi else []):
             if isinstance(it, ZText):
-                it.style(self.font, self.pen_color, self.tx_stretch, self.tx_line)
+                it.style(self.font, self.pen_color, self.tx_stretch, self.tx_line, self.tx_weight)
 
     # ---- export
     def ann_page(self, it):
@@ -624,7 +669,7 @@ ICONS = {
 
 
 def ico(kind):
-    """crisp vector icon: light on dark, dark when the button is checked (green)"""
+    """crisp vector icon: dark grey on light, white when the button is checked (green)"""
     def draw(color, a=1.0):
         pm = QPixmap(64, 64)
         pm.fill(Qt.transparent)
@@ -638,9 +683,9 @@ def ico(kind):
         pm.setDevicePixelRatio(2)
         return pm
     i = QIcon()
-    i.addPixmap(draw("#e5e7eb"), QIcon.Normal, QIcon.Off)
-    i.addPixmap(draw("#0b0d0e"), QIcon.Normal, QIcon.On)
-    i.addPixmap(draw("#6b7280"), QIcon.Disabled, QIcon.Off)
+    i.addPixmap(draw("#374151"), QIcon.Normal, QIcon.Off)
+    i.addPixmap(draw("#ffffff"), QIcon.Normal, QIcon.On)
+    i.addPixmap(draw("#9ca3af"), QIcon.Disabled, QIcon.Off)
     return i
 
 
@@ -685,7 +730,7 @@ class ColorDrop(QToolButton):
         pm.fill(Qt.transparent)
         p = QPainter(pm)
         p.setBrush(self.c)
-        p.setPen(QPen(QColor("#9ca3af"), 1.5))
+        p.setPen(QPen(QColor("#6b7280"), 1.5))
         p.drawRoundedRect(QRectF(1, 1, 32, 20), 4, 4)
         p.end()
         self.setIcon(QIcon(pm))
@@ -744,12 +789,57 @@ class NumCombo(QComboBox):
         e.accept() if self.hasFocus() else e.ignore()
 
 
+class PctSlider(QWidget):
+    """title + slider + live % + reset button (easier than typing numbers)"""
+    valueChanged = Signal(int)
+
+    def __init__(self, title, lo, hi, tip=""):
+        super().__init__()
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        t = QLabel(title)
+        t.setFixedWidth(64)
+        self.s = QSlider(Qt.Horizontal)
+        self.s.setRange(lo, hi)
+        self.s.setValue(100)
+        self.s.setFixedWidth(150)
+        self.s.setPageStep(10)
+        self.lbl = QLabel("100%")
+        self.lbl.setFixedWidth(46)
+        self.lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rb = QToolButton()
+        rb.setObjectName("mini")
+        rb.setText("↺")
+        rb.setToolTip("กลับเป็น 100%")
+        rb.clicked.connect(lambda: self.s.setValue(100))
+        for w in (t, self.s, self.lbl, rb):
+            h.addWidget(w)
+        if tip:
+            for w in (t, self.s):
+                w.setToolTip(tip)
+        self.s.valueChanged.connect(self._changed)
+
+    def _changed(self, v):
+        self.lbl.setText("%d%%" % v)
+        self.valueChanged.emit(v)
+
+    def value(self):
+        return self.s.value()
+
+    def setValue(self, v, emit=True):
+        self.s.blockSignals(not emit)
+        self.s.setValue(int(v))
+        self.s.blockSignals(False)
+        self.lbl.setText("%d%%" % self.s.value())
+
+
 def arrow_png():
     pm = QPixmap(12, 8)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QColor("#e5e7eb"))
+    p.setBrush(QColor("#374151"))
     p.setPen(Qt.NoPen)
     p.drawPolygon(QPolygonF([QPointF(1, 1), QPointF(11, 1), QPointF(6, 7)]))
     p.end()
@@ -759,42 +849,46 @@ def arrow_png():
 
 
 QSS = """
-QMainWindow{background:#1b1d1f}
-QLabel{color:#cbd5e1;font-size:12px}
-QLabel#cap{color:#22C55E;font-size:11px;font-weight:bold}
-QTabBar{background:#16181a}
-QTabBar::tab{background:transparent;color:#cbd5e1;padding:8px 22px;font-size:14px;border:0;border-bottom:3px solid transparent}
-QTabBar::tab:hover{background:#2b2f33}
-QTabBar::tab:selected{color:#22C55E;font-weight:bold;border-bottom:3px solid #22C55E}
-QWidget#panel{background:#202326;border-top:1px solid #3a3f45;border-bottom:2px solid #22C55E}
-QFrame#grp{border:0;border-right:1px solid #566170}
-QFrame#tools{background:#16181a;border-right:1px solid #3a3f45}
-QToolButton{color:#e5e7eb;background:#2b2f33;border:1px solid #3a3f45;border-radius:7px;
+QMainWindow{background:#f3f4f6}
+QLabel{color:#1f2937;font-size:12px}
+QLabel#cap{color:#15803d;font-size:11px;font-weight:bold}
+QTabBar{background:#f3f4f6}
+QTabBar::tab{background:transparent;color:#374151;padding:8px 22px;font-size:14px;border:0;border-bottom:3px solid transparent}
+QTabBar::tab:hover{background:#e5e7eb}
+QTabBar::tab:selected{color:#15803d;font-weight:bold;border-bottom:3px solid #16A34A;background:#ffffff}
+QWidget#panel{background:#ffffff;border-top:1px solid #d1d5db;border-bottom:2px solid #16A34A}
+QFrame#grp{border:0;border-right:1px solid #d1d5db}
+QFrame#tools{background:#ffffff;border-right:1px solid #d1d5db}
+QToolButton{color:#1f2937;background:#f9fafb;border:1px solid #d1d5db;border-radius:7px;
   min-width:66px;min-height:68px;padding:3px 6px;font-size:12px}
-QToolButton:hover{background:#383d42;border-color:#22C55E}
-QToolButton:checked{background:#22C55E;color:#0b0d0e;font-weight:bold;border-color:#22C55E}
-QToolButton:disabled{color:#6b7280}
+QToolButton:hover{background:#e8f7ee;border-color:#16A34A}
+QToolButton:checked{background:#16A34A;color:#ffffff;font-weight:bold;border-color:#15803d}
+QToolButton:disabled{color:#9ca3af}
 QToolButton::menu-indicator{subcontrol-position:bottom right;subcontrol-origin:padding;right:4px;bottom:3px}
 QToolButton#mini{min-width:38px;min-height:30px;padding:0;font-size:15px}
 QToolButton#tool{min-width:78px;min-height:72px;font-size:12px}
-QComboBox{background:#2b2f33;color:#e5e7eb;border:1px solid #4b5563;border-radius:6px;padding:2px 8px;
+QComboBox{background:#ffffff;color:#111827;border:1px solid #9ca3af;border-radius:6px;padding:2px 8px;
   min-height:28px;font-size:13px;combobox-popup:0}
-QComboBox:hover,QComboBox:focus{border-color:#22C55E}
+QComboBox:hover,QComboBox:focus{border-color:#16A34A}
 QComboBox::drop-down{border:0;width:26px}
 QComboBox::down-arrow{image:url(%ARROW%);width:12px;height:8px}
-QComboBox QLineEdit{background:transparent;border:0;color:#e5e7eb;selection-background-color:#22C55E;selection-color:#0b0d0e}
-QComboBox QAbstractItemView{background:#232629;color:#e5e7eb;border:1px solid #22C55E;
-  selection-background-color:#22C55E;selection-color:#0b0d0e;outline:0}
+QComboBox QLineEdit{background:transparent;border:0;color:#111827;selection-background-color:#16A34A;selection-color:#ffffff}
+QComboBox QAbstractItemView{background:#ffffff;color:#111827;border:1px solid #16A34A;
+  selection-background-color:#16A34A;selection-color:#ffffff;outline:0}
 QComboBox QAbstractItemView::item{min-height:30px;padding-left:10px}
-QMenu{background:#232629;color:#e5e7eb;border:1px solid #3a3f45;padding:4px}
+QMenu{background:#ffffff;color:#111827;border:1px solid #d1d5db;padding:4px}
 QMenu::item{padding:7px 26px;min-height:22px;font-size:13px}
-QMenu::item:selected{background:#22C55E;color:#0b0d0e}
-QMenu::separator{height:1px;background:#3a3f45;margin:4px 8px}
-QStatusBar{background:#16181a;color:#9ca3af}
-QPushButton#upd{background:#22C55E;color:#000;border:0;border-radius:4px;padding:3px 12px;font-weight:bold}
-QToolTip{background:#232629;color:#e5e7eb;border:1px solid #22C55E;padding:4px}
-QScrollBar:vertical{background:#1b1d1f;width:14px}
-QScrollBar::handle:vertical{background:#4b5563;border-radius:6px;min-height:30px}
+QMenu::item:selected{background:#16A34A;color:#ffffff}
+QMenu::separator{height:1px;background:#e5e7eb;margin:4px 8px}
+QSlider::groove:horizontal{height:6px;background:#d1d5db;border-radius:3px}
+QSlider::sub-page:horizontal{background:#16A34A;border-radius:3px}
+QSlider::handle:horizontal{background:#ffffff;border:2px solid #16A34A;width:16px;margin:-7px 0;border-radius:9px}
+QSlider::handle:horizontal:hover{background:#dcfce7}
+QStatusBar{background:#f3f4f6;color:#4b5563}
+QPushButton#upd{background:#16A34A;color:#ffffff;border:0;border-radius:4px;padding:3px 12px;font-weight:bold}
+QToolTip{background:#ffffff;color:#111827;border:1px solid #16A34A;padding:4px}
+QScrollBar:vertical{background:#f3f4f6;width:14px}
+QScrollBar::handle:vertical{background:#9ca3af;border-radius:6px;min-height:30px}
 QScrollBar::add-line,QScrollBar::sub-line{height:0}
 """
 
@@ -931,10 +1025,11 @@ class Main(QMainWindow):
         self.fc.setCurrentFont(QFont("Tahoma"))
         self.fc.currentFontChanged.connect(self.font_changed)
         self.fs = NumCombo(16, [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 60, 72, 96], 4, 400)
-        self.fw = NumCombo(100, [25, 50, 75, 100, 125, 150, 175, 200, 225], 25, 250)   # weight %  (100 = regular)
-        self.fls = NumCombo(100, [50, 75, 90, 100, 110, 125, 150, 200, 300], 20, 500)  # letter spacing %
-        self.fx = NumCombo(100, [50, 70, 80, 90, 100, 110, 120, 150, 200], 30, 300)    # width / compress %
-        for c in (self.fs, self.fw, self.fls, self.fx):
+        self.fw = PctSlider("ความหนา", 25, 300, "ลากไปขวา = หนาขึ้น, ซ้าย = บางลง (100% = ปกติ)")
+        self.fls = PctSlider("ระยะห่าง", 50, 300, "ระยะห่างระหว่างตัวอักษร (100% = ปกติ)")
+        self.fx = PctSlider("บีบ–ขยาย", 50, 200, "ซ้าย = บีบให้แคบ, ขวา = ขยายให้กว้าง (100% = ปกติ)")
+        self.fs.valueChanged.connect(self.font_changed)
+        for c in (self.fw, self.fls, self.fx):
             c.valueChanged.connect(self.font_changed)
         self.fi = mini("I", self.font_changed, italic=True)
         self.fu = mini("U", self.font_changed, underline=True)
@@ -1004,8 +1099,7 @@ class Main(QMainWindow):
         th.setSpacing(0)
         for g in (Group("ฟอนต์", rows([self.fc, self.fs], [self.fi, self.fu])),
                   Group("สี", self.cb_txt),
-                  Group("ตัวอักษร (%)", rows([lab("ความหนา"), self.fw], [lab("ระยะห่าง"), self.fls],
-                                              [lab("ความกว้าง"), self.fx])),
+                  Group("ตัวอักษร (ลากแถบ)", rows(self.fw, self.fls, self.fx)),
                   Group("ย่อหน้า", self.ls_btn),
                   Group("กล่องข้อความ", big("กว้างอัตโนมัติ", "fit", self.reset_width),
                         rows([lab("ลากจุดเขียวที่ขอบขวา")], [lab("ของกล่อง เพื่อกำหนด")], [lab("ความกว้าง/ตัดบรรทัด")]))):
@@ -1086,33 +1180,33 @@ class Main(QMainWindow):
     def font_changed(self, *_):
         f = QFont(self.fc.currentFont())
         f.setPointSize(self.fs.value())
-        f.setWeight(QFont.Weight(min(1000, max(1, self.fw.value() * 4))))  # 100 % = 400 = regular
+        if self.fw.value() < 100:  # thinner = real lighter weight (needs a font that has it); thicker = faux-bold stroke
+            f.setWeight(QFont.Weight(max(100, self.fw.value() * 4)))
         f.setItalic(self.fi.isChecked())
         f.setUnderline(self.fu.isChecked())
         f.setLetterSpacing(QFont.PercentageSpacing, float(self.fls.value()))  # % of glyph width: same on screen and PDF
         self.cv.font = f
-        self.cv.tx_stretch, self.cv.tx_line = self.fx.value(), self.lh
+        self.cv.tx_stretch, self.cv.tx_line, self.cv.tx_weight = self.fx.value(), self.lh, self.fw.value()
         self.cv.apply_text_style()
 
     def load_text_style(self, it):
         """show the selected text box's own style in the controls (without applying anything)"""
         f = it.font()
-        wv = lambda w: getattr(w, "value", w)
         self.fc.blockSignals(True)
         self.fc.setCurrentFont(f)
         self.fc.blockSignals(False)
         self.fs.setValue(max(4, f.pointSize()))
-        self.fw.setValue(min(250, max(25, round(wv(f.weight()) / 4))))
+        self.fw.setValue(it.wt, False)
         self.fi.setChecked(f.italic())
         self.fu.setChecked(f.underline())
-        self.fls.setValue(int(f.letterSpacing()) if f.letterSpacingType() == QFont.PercentageSpacing else 100)
-        self.fx.setValue(it.sx)
+        self.fls.setValue(int(f.letterSpacing()) if f.letterSpacingType() == QFont.PercentageSpacing else 100, False)
+        self.fx.setValue(it.sx, False)
         self.set_line(it.lh, False)
         col = it.defaultTextColor()
         self.cb_pen.set_color(col)
         self.cb_txt.set_color(col)
         self.cv.font, self.cv.pen_color = QFont(f), col
-        self.cv.tx_stretch, self.cv.tx_line = it.sx, it.lh
+        self.cv.tx_stretch, self.cv.tx_line, self.cv.tx_weight = it.sx, it.lh, it.wt
 
     # ---- file
     def confirm_discard(self):
@@ -1167,18 +1261,19 @@ class Main(QMainWindow):
         self.statusBar().showMessage("บันทึกแล้ว: " + f, 6000)
 
     def print_pdf(self):
+        """print preview (shows exactly what will be printed) -> its Print button opens the printer dialog"""
         if not self.cv.doc:
             return
         n = len(self.cv.pages)
-        pr = QPrinter(QPrinter.HighResolution)
-        dlg = QPrintDialog(pr, self)
-        dlg.setOption(QAbstractPrintDialog.PrintPageRange, True)
-        dlg.setMinMax(1, n)
-        if dlg.exec() != QPrintDialog.Accepted:
-            return
+        dlg = QPrintPreviewDialog(QPrinter(QPrinter.HighResolution), self)
+        dlg.paintRequested.connect(lambda p: self._paint_print(p, n))
+        dlg.resize(1000, 820)
+        dlg.exec()
+
+    def _paint_print(self, pr, n):
         a, b = (pr.fromPage(), pr.toPage()) if pr.printRange() == QPrinter.PageRange else (1, n)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
             self.cv.print_to(pr, max(1, a), min(n, b or n))
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, "พิมพ์ไม่สำเร็จ:\n%s: %s" % (type(e).__name__, e))
@@ -1253,25 +1348,25 @@ class Main(QMainWindow):
         QMessageBox.information(self, APP_NAME, "อัปเดตเป็น %s แล้ว ปิดแล้วเปิดโปรแกรมใหม่" % ver)
 
 
-def dark_theme(app):
+def light_theme(app):
     app.setStyle("Fusion")
     p = QPalette()
-    for role, c in [(QPalette.Window, "#1b1d1f"), (QPalette.WindowText, "#e5e7eb"), (QPalette.Base, "#232629"),
-                    (QPalette.AlternateBase, "#2b2f33"), (QPalette.ToolTipBase, "#232629"),
-                    (QPalette.ToolTipText, "#e5e7eb"), (QPalette.Text, "#e5e7eb"), (QPalette.Button, "#2b2f33"),
-                    (QPalette.ButtonText, "#e5e7eb"), (QPalette.BrightText, "#ffffff"),
-                    (QPalette.Highlight, "#22C55E"), (QPalette.HighlightedText, "#0b0d0e"),
-                    (QPalette.Link, "#22C55E"), (QPalette.PlaceholderText, "#6b7280")]:
+    for role, c in [(QPalette.Window, "#f3f4f6"), (QPalette.WindowText, "#1f2937"), (QPalette.Base, "#ffffff"),
+                    (QPalette.AlternateBase, "#f3f4f6"), (QPalette.ToolTipBase, "#ffffff"),
+                    (QPalette.ToolTipText, "#111827"), (QPalette.Text, "#111827"), (QPalette.Button, "#ffffff"),
+                    (QPalette.ButtonText, "#1f2937"), (QPalette.BrightText, "#000000"),
+                    (QPalette.Highlight, "#16A34A"), (QPalette.HighlightedText, "#ffffff"),
+                    (QPalette.Link, "#15803d"), (QPalette.PlaceholderText, "#9ca3af")]:
         p.setColor(role, QColor(c))
     for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
-        p.setColor(QPalette.Disabled, role, QColor("#6b7280"))
+        p.setColor(QPalette.Disabled, role, QColor("#9ca3af"))
     app.setPalette(p)
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    dark_theme(app)
+    light_theme(app)
     for ef in (Qt.UI_AnimateCombo, Qt.UI_AnimateMenu, Qt.UI_FadeMenu, Qt.UI_FadeTooltip):
         app.setEffectEnabled(ef, True)  # smooth dropdowns
 
