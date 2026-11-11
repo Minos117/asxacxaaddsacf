@@ -13,10 +13,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QFontComboBox, QLabel, QFileDialog, QMessageBox, QInputDialog,
                                QLineEdit, QToolButton, QFrame, QVBoxLayout, QHBoxLayout,
                                QWidget, QStackedWidget, QButtonGroup, QComboBox, QTabBar, QMenu, QGridLayout,
-                               QWidgetAction, QSlider)
-from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
+                               QWidgetAction, QSlider, QDialog)
+from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 
-APP_VER = "1.0.2"
+APP_VER = "1.0.3"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -867,28 +867,67 @@ class Canvas(QGraphicsView):
             f.write(data)
         os.replace(tmp, path)
 
-    def print_to(self, printer, a, b):
-        d = fitz.open("pdf", self.make_pdf(True))  # printing: fields become plain content, items verified visible
+    def print_doc(self):
+        """the finished PDF (items verified visible, form fields flattened) as a document to print"""
+        d = fitz.open("pdf", self.make_pdf(True))
         if d.needs_pass:
             d.authenticate(self.password)
-        s = min(printer.resolution(), 300) / 72  # cap dpi: 1200dpi page = hundreds of MB
+        return d
+
+    def print_pages(self, printer, doc, pages, fit=True, orient="auto", gray=False):
+        """pages = 0-based indexes; fit=True scales to the printable area, False prints at 100 %;
+        orient = auto (by page shape) / portrait / landscape. The page is rasterised at <=300 dpi."""
+        s = min(printer.resolution(), 300) / 72  # 1200 dpi pages would be hundreds of MB
+        dpp = printer.resolution() / 72           # printer pixels per point
         painter = None
-        for n, i in enumerate(range(a - 1, b)):
-            pg = d[i]
-            printer.setPageOrientation(QPageLayout.Landscape if pg.rect.width > pg.rect.height
-                                       else QPageLayout.Portrait)
+        for n, i in enumerate(pages):
+            pg = doc[i]
+            pw, ph = pg.rect.width, pg.rect.height
+            land = orient == "landscape" or (orient == "auto" and pw > ph)
+            printer.setPageOrientation(QPageLayout.Landscape if land else QPageLayout.Portrait)
             if n == 0:
                 painter = QPainter(printer)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
             else:
                 printer.newPage()
             pm = pg.get_pixmap(matrix=fitz.Matrix(s, s), alpha=False)
             img = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format_RGB888).copy()
+            if gray:  # do not rely on the driver's colour setting
+                img = img.convertToFormat(QImage.Format_Grayscale8)
             pr = printer.pageRect(QPrinter.DevicePixel)
-            sz = img.size().scaled(int(pr.width()), int(pr.height()), Qt.KeepAspectRatio)
-            painter.drawImage(QRectF((pr.width() - sz.width()) / 2, 0, sz.width(), sz.height()), img)
+            painter.drawImage(place(pr.width(), pr.height(), pw * dpp, ph * dpp, fit), img)
         if painter:
             painter.end()
+
+    def print_to(self, printer, a, b):  # simple helper (pages a..b, 1-based)
+        d = self.print_doc()
+        self.print_pages(printer, d, list(range(a - 1, b)))
         d.close()
+
+
+def place(avail_w, avail_h, pw, ph, fit):
+    """rectangle for a page of size pw x ph centred on an area avail_w x avail_h (same units)"""
+    k = min(avail_w / pw, avail_h / ph) if fit else 1.0
+    return QRectF((avail_w - pw * k) / 2, (avail_h - ph * k) / 2, pw * k, ph * k)
+
+
+def parse_pages(text, n):
+    """'1-3, 5' -> [0, 1, 2, 4]; ValueError on anything invalid"""
+    out = []
+    for part in re.split(r"[,\s;]+", text.strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise ValueError(part)
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if a < 1 or b < a or b > n:
+            raise ValueError(part)
+        out.extend(range(a - 1, b))
+    if not out:
+        raise ValueError("empty")
+    seen = set()
+    return [i for i in out if not (i in seen or seen.add(i))]
 
 
 # ---------------------------------------------------------------- window
@@ -1193,6 +1232,16 @@ QSlider::groove:horizontal{height:6px;background:#d1d5db;border-radius:3px}
 QSlider::sub-page:horizontal{background:#16A34A;border-radius:3px}
 QSlider::handle:horizontal{background:#ffffff;border:2px solid #16A34A;width:16px;margin:-7px 0;border-radius:9px}
 QSlider::handle:horizontal:hover{background:#dcfce7}
+QDialog{background:#f3f4f6}
+QLineEdit{background:#ffffff;color:#111827;border:1px solid #9ca3af;border-radius:6px;min-height:28px;padding:0 8px;font-size:13px}
+QLineEdit:focus{border-color:#16A34A}
+QPushButton#primary{background:#16A34A;color:#ffffff;border:0;border-radius:8px;font-size:20px;font-weight:bold;min-height:58px;min-width:170px}
+QPushButton#primary:hover{background:#15803d}
+QPushButton#primary:disabled{background:#9ca3af}
+QPushButton#plain{background:#f9fafb;color:#1f2937;border:1px solid #9ca3af;border-radius:6px;min-height:34px;padding:0 18px;font-size:13px}
+QPushButton#plain:hover{border-color:#16A34A;background:#e8f7ee}
+QLabel#title{font-size:26px;font-weight:bold;color:#111827}
+QLabel#field{font-size:12px;color:#4b5563;font-weight:bold}
 QStatusBar{background:#f3f4f6;color:#4b5563}
 QPushButton#upd{background:#16A34A;color:#ffffff;border:0;border-radius:4px;padding:3px 12px;font-weight:bold}
 QToolTip{background:#ffffff;color:#111827;border:1px solid #16A34A;padding:4px}
@@ -1269,6 +1318,273 @@ def mini(text, fn, italic=False, underline=False):
     b.setFont(f)
     b.clicked.connect(fn)
     return b
+
+
+class PaperView(QWidget):
+    """big preview: a sheet of the chosen paper with the page placed exactly as it will be printed"""
+    MARGIN_PT = 12  # typical unprintable border, only for the preview (the printer reports its real one)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(460, 480)
+        self.img, self.page_pts, self.paper, self.fit, self.gray = None, (595.0, 842.0), (595.0, 842.0), True, False
+
+    def show_page(self, img, page_pts, paper_pts, fit, gray):
+        self.img = img.convertToFormat(QImage.Format_Grayscale8) if (img is not None and gray) else img
+        self.page_pts, self.paper, self.fit, self.gray = page_pts, paper_pts, fit, gray
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        p.fillRect(self.rect(), QColor("#9aa1ab"))
+        pw, ph = self.paper
+        k = min((self.width() - 56) / pw, (self.height() - 56) / ph)
+        rw, rh = pw * k, ph * k
+        x, y = (self.width() - rw) / 2, (self.height() - rh) / 2
+        p.fillRect(QRectF(x + 5, y + 6, rw, rh), QColor(0, 0, 0, 70))
+        p.fillRect(QRectF(x, y, rw, rh), QColor("#ffffff"))
+        if self.img is not None:
+            m = self.MARGIN_PT
+            t = place(pw - 2 * m, ph - 2 * m, self.page_pts[0], self.page_pts[1], self.fit)
+            p.setClipRect(QRectF(x + m * k, y + m * k, rw - 2 * m * k, rh - 2 * m * k))
+            p.drawImage(QRectF(x + (m + t.x()) * k, y + (m + t.y()) * k, t.width() * k, t.height() * k), self.img)
+
+
+class PrintDialog(QDialog):
+    """Word-style print page: settings on the left, large live preview on the right"""
+    PAPERS = [("A4", QPageSize.A4), ("A3", QPageSize.A3), ("A5", QPageSize.A5), ("Letter", QPageSize.Letter),
+              ("Legal", QPageSize.Legal), ("F4 / Folio", QPageSize.Folio)]
+
+    def __init__(self, cv, parent=None):
+        super().__init__(parent)
+        self.cv = cv
+        self.setWindowTitle("พิมพ์ - " + APP_NAME)
+        self.resize(1080, 760)
+        self.n = len(cv.pages)
+        self.cur = cv.cur_page
+        self.pos = 0          # index into the list of pages to print (for the preview)
+        self.cache = {}
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.doc = cv.print_doc()   # also what gets printed: verified, form fields flattened
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._printer = None
+
+        side = QWidget()
+        side.setFixedWidth(360)
+        v = QVBoxLayout(side)
+        v.setContentsMargins(22, 18, 18, 18)
+        v.setSpacing(6)
+        t = QLabel("พิมพ์")
+        t.setObjectName("title")
+        v.addWidget(t)
+        top = QHBoxLayout()
+        self.btn_print = QPushButton("พิมพ์")
+        self.btn_print.setObjectName("primary")
+        self.btn_print.setDefault(True)
+        self.btn_print.clicked.connect(self.print_now)
+        self.copies = NumCombo(1, [1, 2, 3, 4, 5, 10], 1, 99, 76)
+        cl = QVBoxLayout()
+        cl.addWidget(self.field("จำนวนชุด"))
+        cl.addWidget(self.copies)
+        top.addWidget(self.btn_print)
+        top.addSpacing(10)
+        top.addLayout(cl)
+        top.addStretch()
+        v.addLayout(top)
+        v.addSpacing(8)
+
+        self.printer = QComboBox()
+        names = QPrinterInfo.availablePrinterNames()
+        for nme in names:
+            self.printer.addItem(nme)
+        dflt = QPrinterInfo.defaultPrinterName()
+        if dflt in names:
+            self.printer.setCurrentText(dflt)
+        if not names:
+            self.printer.addItem("ไม่พบเครื่องพิมพ์ในเครื่องนี้")
+            self.printer.setEnabled(False)
+            self.btn_print.setEnabled(False)
+        self.printer.currentIndexChanged.connect(self._printer_changed)
+        self.paper = QComboBox()
+        self.range = QComboBox()
+        self.range.addItems(["ทุกหน้า", "หน้าปัจจุบัน (หน้า %d)" % (self.cur + 1), "ระบุหน้าเอง…"])
+        self.pages_txt = QLineEdit()
+        self.pages_txt.setPlaceholderText("เช่น 1-3, 5")
+        self.pages_txt.setText("1-%d" % self.n)
+        self.pages_txt.hide()
+        self.range.currentIndexChanged.connect(self._range_changed)
+        self.pages_txt.textChanged.connect(self._refresh)
+        self.duplex = QComboBox()
+        self.duplex.addItems(["พิมพ์ด้านเดียว", "สองด้าน (พลิกด้านยาว)", "สองด้าน (พลิกด้านสั้น)"])
+        self.orient = QComboBox()
+        self.orient.addItems(["อัตโนมัติ (ตามรูปร่างของหน้า)", "แนวตั้ง", "แนวนอน"])
+        self.color = QComboBox()
+        self.color.addItems(["สี", "ขาวดำ"])
+        self.scale = QComboBox()
+        self.scale.addItems(["พอดีหน้ากระดาษ", "ขนาดจริง (100%)"])
+        for lbl, w in (("เครื่องพิมพ์", self.printer), ("หน้าที่พิมพ์", self.range), (None, self.pages_txt),
+                       ("ด้านการพิมพ์", self.duplex), ("ขนาดกระดาษ", self.paper), ("ทิศทางกระดาษ", self.orient),
+                       ("สี", self.color), ("ย่อ/ขยาย", self.scale)):
+            if lbl:
+                v.addWidget(self.field(lbl))
+            v.addWidget(w)
+        for c in (self.duplex, self.orient, self.color, self.scale, self.paper):
+            c.currentIndexChanged.connect(self._refresh)
+        self.msg = QLabel("")
+        self.msg.setWordWrap(True)
+        v.addWidget(self.msg)
+        v.addStretch()
+        cancel = QPushButton("ยกเลิก")
+        cancel.setObjectName("plain")
+        cancel.clicked.connect(self.reject)
+        v.addWidget(cancel)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+        self.view = PaperView()
+        rv.addWidget(self.view, 1)
+        nav = QWidget()
+        nav.setStyleSheet("background:#f3f4f6")
+        nh = QHBoxLayout(nav)
+        nh.setContentsMargins(10, 8, 10, 8)
+        self.prev = QPushButton("◀")
+        self.prev.setObjectName("plain")
+        self.next = QPushButton("▶")
+        self.next.setObjectName("plain")
+        self.prev.clicked.connect(lambda: self._go(-1))
+        self.next.clicked.connect(lambda: self._go(1))
+        self.info = QLabel("")
+        self.info.setAlignment(Qt.AlignCenter)
+        nh.addStretch()
+        nh.addWidget(self.prev)
+        nh.addWidget(self.info)
+        nh.addWidget(self.next)
+        nh.addStretch()
+        rv.addWidget(nav)
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        h.addWidget(side)
+        h.addWidget(right, 1)
+        if cv.notes:
+            self.msg.setText("ℹ " + "\n".join(cv.notes))
+        self._printer_changed()
+
+    @staticmethod
+    def field(text):
+        lb = QLabel(text)
+        lb.setObjectName("field")
+        return lb
+
+    # ---- state -> printer / preview
+    def _info(self):
+        return QPrinterInfo.printerInfo(self.printer.currentText()) if self.printer.isEnabled() else None
+
+    def _printer_changed(self, *_):
+        info = self._info()
+        keep = self.paper.currentData()
+        self.paper.blockSignals(True)
+        self.paper.clear()
+        sizes = [(ps.name(), ps) for ps in info.supportedPageSizes()] if info and not info.isNull() else []
+        if not sizes:
+            sizes = [(nm, QPageSize(sz)) for nm, sz in self.PAPERS]
+        for nm, ps in sizes:
+            self.paper.addItem(nm, ps)
+        want = info.defaultPageSize().name() if info and not info.isNull() else "A4"
+        for i in range(self.paper.count()):
+            if self.paper.itemText(i) in (want, getattr(keep, "name", lambda: "")()):
+                self.paper.setCurrentIndex(i)
+                break
+        self.paper.blockSignals(False)
+        self._refresh()
+
+    def _range_changed(self, i):
+        self.pages_txt.setVisible(i == 2)
+        self._refresh()
+
+    def selected_pages(self):
+        """0-based pages to print; ValueError if the typed range is invalid"""
+        k = self.range.currentIndex()
+        if k == 0:
+            return list(range(self.n))
+        if k == 1:
+            return [self.cur]
+        return parse_pages(self.pages_txt.text(), self.n)
+
+    def _go(self, d):
+        self.pos += d
+        self._refresh()
+
+    def _page_img(self, i):
+        if i not in self.cache:
+            pm = self.doc[i].get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
+            self.cache[i] = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format_RGB888).copy()
+        return self.cache[i]
+
+    def _refresh(self, *_):
+        try:
+            pages = self.selected_pages()
+            bad = False
+        except ValueError:
+            pages, bad = [], True
+        self.pages_txt.setStyleSheet("border:2px solid #dc2626" if bad else "")
+        ok = bool(pages) and self.printer.isEnabled()
+        self.btn_print.setEnabled(ok)
+        self.prev.setEnabled(self.pos > 0)
+        self.next.setEnabled(self.pos < len(pages) - 1)
+        if not pages:
+            self.view.show_page(None, (1, 1), self.view.paper, True, False)
+            self.info.setText("ช่วงหน้าไม่ถูกต้อง (มี %d หน้า)" % self.n if bad else "")
+            return
+        self.pos = max(0, min(self.pos, len(pages) - 1))
+        i = pages[self.pos]
+        pg = self.doc[i]
+        pw, ph = pg.rect.width, pg.rect.height
+        sz = self.paper.currentData().sizePoints() if self.paper.currentData() is not None else QSizeF(595, 842)
+        short, long_ = sorted((sz.width(), sz.height()))
+        o = self.orient.currentIndex()
+        land = o == 2 or (o == 0 and pw > ph)
+        paper = (long_, short) if land else (short, long_)
+        self.view.show_page(self._page_img(i), (pw, ph), paper, self.scale.currentIndex() == 0, self.color.currentIndex() == 1)
+        self.info.setText("หน้า %d   (แผ่นที่ %d จาก %d ที่จะพิมพ์)   %s" % (
+            i + 1, self.pos + 1, len(pages), "แนวนอน" if land else "แนวตั้ง"))
+
+    # ---- print
+    def make_printer(self):
+        info = self._info()
+        pr = QPrinter(info, QPrinter.HighResolution) if info and not info.isNull() else QPrinter(QPrinter.HighResolution)
+        ps = self.paper.currentData()
+        if ps is not None:
+            pr.setPageSize(ps)
+        pr.setCopyCount(self.copies.value())
+        pr.setCollateCopies(True)
+        pr.setColorMode(QPrinter.GrayScale if self.color.currentIndex() == 1 else QPrinter.Color)
+        pr.setDuplex([QPrinter.DuplexNone, QPrinter.DuplexLongSide, QPrinter.DuplexShortSide][self.duplex.currentIndex()])
+        pr.setDocName("ZAIA PDF")
+        return pr
+
+    def print_now(self, printer=None):
+        """printer=None -> the selected one; tests pass a PDF printer"""
+        try:
+            pages = self.selected_pages()
+        except ValueError:
+            return
+        self._printer = printer or self.make_printer()  # keep a reference for the whole job
+        o = ("auto", "portrait", "landscape")[self.orient.currentIndex()]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.cv.print_pages(self._printer, self.doc, pages, self.scale.currentIndex() == 0, o, self.color.currentIndex() == 1)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            return QMessageBox.critical(self, APP_NAME, "พิมพ์ไม่สำเร็จ:\n%s: %s" % (type(e).__name__, e))
+        QApplication.restoreOverrideCursor()
+        self.accept()
 
 
 class Main(QMainWindow):
@@ -1690,25 +2006,11 @@ class Main(QMainWindow):
         self._after_save(f)
 
     def print_pdf(self):
-        """print preview (shows exactly what will be printed) -> its Print button opens the printer dialog"""
         if not self.cv.doc:
             return
-        n = len(self.cv.pages)
-        self._printer = QPrinter(QPrinter.HighResolution)  # must outlive the dialog: it keeps only a pointer (a temporary crashed the app)
-        dlg = QPrintPreviewDialog(self._printer, self)
-        dlg.paintRequested.connect(lambda p: self._paint_print(p, n))
-        dlg.resize(1000, 820)
-        dlg.exec()
-
-    def _paint_print(self, pr, n):
-        a, b = (pr.fromPage(), pr.toPage()) if pr.printRange() == QPrinter.PageRange else (1, n)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            self.cv.print_to(pr, max(1, a), min(n, b or n))
-        except Exception as e:
-            QMessageBox.critical(self, APP_NAME, "พิมพ์ไม่สำเร็จ:\n%s: %s" % (type(e).__name__, e))
-        finally:
-            QApplication.restoreOverrideCursor()
+        dlg = PrintDialog(self.cv, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.statusBar().showMessage("ส่งงานพิมพ์แล้ว", 6000)
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
