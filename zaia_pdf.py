@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QWidgetAction, QSlider)
 from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 
-APP_VER = "1.0.1"
+APP_VER = "1.0.2"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -1694,7 +1694,8 @@ class Main(QMainWindow):
         if not self.cv.doc:
             return
         n = len(self.cv.pages)
-        dlg = QPrintPreviewDialog(QPrinter(QPrinter.HighResolution), self)
+        self._printer = QPrinter(QPrinter.HighResolution)  # must outlive the dialog: it keeps only a pointer (a temporary crashed the app)
+        dlg = QPrintPreviewDialog(self._printer, self)
         dlg.paintRequested.connect(lambda p: self._paint_print(p, n))
         dlg.resize(1000, 820)
         dlg.exec()
