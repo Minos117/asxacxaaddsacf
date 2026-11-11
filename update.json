@@ -1,10 +1,13 @@
 {
-  "version": "1.1.1",
+  "version": "1.2.0",
   "setup_rev": 1,
   "files": {
-    "zaia_pdf.py": "5033c8f87e19cba832decc58c49cc169fa30770a1b9d5c34eebcf0e8debbb86b",
+    "zaia_pdf.py": "dcff76fe72b337d8ea673503acd9bc93bad949c30cac21e134ce151152b37d3a",
     "zaia.ico": "30202817ab8dd4e90e8d9af8475a582a744382a497bac2acb5b2fffbd78b504a",
     "logo.png": "a5cff9d3445c517af1b36c5e4311047c8d06175369dbb197ef867eef8405bf94",
-    "ZAIA_PDF.bat": "e54e52c7a433a1f96b9b145ccc7a0e7e1528be0acb9d80a2852af5d2c221c8ee"
+    "ZAIA_PDF.bat": "e54e52c7a433a1f96b9b145ccc7a0e7e1528be0acb9d80a2852af5d2c221c8ee",
+    "tessdata/tha.traineddata": "ee8adab6dc69eb8df3d3c8307ae8295471b7bd7d86a06d9267aa8f479b064eac",
+    "fonts/Sarabun-Regular.ttf": "226d4f368fbc0457990ddef2692679badfd2c1a4e89e5ac4d43c10ba7743b2f1",
+    "fonts/OFL.txt": "b26cae1321380296ba8311b632a397d5eac11b47197f9d0aa0b9310f1531ad60"
   }
 }

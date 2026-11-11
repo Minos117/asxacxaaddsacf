@@ -6,7 +6,8 @@ import re, json, hashlib, zipfile, sys
 from pathlib import Path
 
 D = Path(__file__).resolve().parent
-UPDATABLE = ["zaia_pdf.py", "zaia.ico", "logo.png", "ZAIA_PDF.bat"]
+UPDATABLE = ["zaia_pdf.py", "zaia.ico", "logo.png", "ZAIA_PDF.bat",
+             "tessdata/tha.traineddata", "fonts/Sarabun-Regular.ttf", "fonts/OFL.txt"]  # OCR language data + invisible-text font
 EXTRA = ["ZAIA_PDF.exe", "Launcher.cs", "Build_All.bat", "build_all.py", "ZAIA_PDF.iss", "MakeRelease.py", "setup_rev.txt", "update.json"]
 
 

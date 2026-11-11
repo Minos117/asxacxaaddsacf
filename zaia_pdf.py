@@ -1,9 +1,9 @@
 # ZAIA PDF - PDF annotator (PySide6 + PyMuPDF). Adds ink/highlight/text on top of pages.
-import sys, os, re, json, math, time, shutil, hashlib, tempfile, threading, urllib.request, urllib.parse
+import sys, os, re, json, math, time, unicodedata, shutil, hashlib, tempfile, threading, urllib.request, urllib.parse
 from pathlib import Path
 import pymupdf as fitz
 from PySide6.QtCore import (Qt, QPointF, QRectF, QSizeF, QSize, QMarginsF, QTimer, QBuffer, QIODevice,
-                            Signal, QObject, QSettings)
+                            Signal, QObject, QSettings, QProcess, QEventLoop)
 from PySide6.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPalette,
                            QPen, QPixmap, QPageSize, QPageLayout, QPdfWriter, QIcon, QKeySequence,
                            QTransform, QTextCursor, QTextBlockFormat, QPolygonF, QIntValidator, QFontDatabase)
@@ -13,10 +13,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QFontComboBox, QLabel, QFileDialog, QMessageBox, QInputDialog,
                                QLineEdit, QToolButton, QFrame, QVBoxLayout, QHBoxLayout,
                                QWidget, QStackedWidget, QButtonGroup, QComboBox, QTabBar, QMenu, QGridLayout,
-                               QWidgetAction, QSlider, QDialog, QPlainTextEdit)
+                               QWidgetAction, QSlider, QDialog, QPlainTextEdit, QProgressDialog, QScrollArea, QTabWidget,
+                               QCheckBox)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 
-APP_VER = "1.1.1"
+APP_VER = "1.2.0"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -326,6 +327,125 @@ class ZImage(QGraphicsPixmapItem):
         return super().itemChange(change, value)
 
 
+# ---------------------------------------------------------------- OCR (offline, Tesseract inside PyMuPDF)
+OCR_FONT = APP_DIR / "fonts" / "Sarabun-Regular.ttf"
+_DIGIT = re.compile("[0-9\u0e50-\u0e59]")
+
+
+def ocr_tessdata():
+    """folder holding tha.traineddata (shipped next to the program), or None"""
+    d = APP_DIR / "tessdata"
+    if (d / "tha.traineddata").exists():
+        return str(d)
+    try:
+        t = fitz.get_tessdata()
+        if t and (Path(t) / "tha.traineddata").exists():
+            return str(t)
+    except Exception:
+        pass
+    return None
+
+
+def ocr_clean(t):
+    t = unicodedata.normalize("NFC", t).replace("\u0e4d\u0e32", "\u0e33")  # nikhahit + sara aa -> sara am
+    return re.sub(r"[ \t]+", " ", t).strip()
+
+
+def ocr_page_lines(page, tessdata, language="tha", dpi=300):
+    """OCR what the page SHOWS (rotation applied): [{'bbox': (x0, y0, x1, y1) in displayed page points, 'text': str}]"""
+    pix = page.get_pixmap(dpi=dpi, alpha=False)
+    res = fitz.open("pdf", pix.pdfocr_tobytes(compress=False, language=language, tessdata=tessdata))
+    sx, sy = page.rect.width / res[0].rect.width, page.rect.height / res[0].rect.height
+    words = [w for w in res[0].get_text("words") if w[4].strip()]
+    words.sort(key=lambda w: ((w[1] + w[3]) / 2, w[0]))
+    rows = []
+    for w in words:  # fragments -> text lines
+        h = w[3] - w[1]
+        cy = (w[1] + w[3]) / 2
+        for r in rows:
+            if abs(cy - r["cy"]) < max(h, r["h"]) * 0.45:
+                r["w"].append(w)
+                n = len(r["w"])
+                r["cy"] = (r["cy"] * (n - 1) + cy) / n
+                r["h"] = max(r["h"], h)
+                break
+        else:
+            rows.append({"w": [w], "cy": cy, "h": h})
+    out = []
+    for r in sorted(rows, key=lambda r: r["cy"]):
+        ws = sorted(r["w"], key=lambda w: w[0])
+        text = ocr_clean(" ".join(w[4] for w in ws))
+        if text:
+            out.append({"bbox": (min(w[0] for w in ws) * sx, min(w[1] for w in ws) * sy,
+                                 max(w[2] for w in ws) * sx, max(w[3] for w in ws) * sy), "text": text})
+    return out
+
+
+def line_flags(text):
+    """(has_digits, probably_noise): digits are what OCR gets wrong most; noise = handwriting/stamp/logo junk"""
+    visible = sum(1 for c in text if not c.isspace())
+    letters = sum(1 for c in text if c.isalpha() or "\u0e01" <= c <= "\u0e4e")
+    return bool(_DIGIT.search(text)), (visible <= 2 or letters < 0.5 * visible)
+
+
+_OCR_FONTS = {}
+
+
+def add_text_layer(pg, lines, fontfile):
+    """invisible (render mode 3) text under a scan so it can be searched and copied; lines are in displayed-page points"""
+    font = _OCR_FONTS.setdefault(fontfile, fitz.Font(fontfile=fontfile))
+    dm, rot = pg.derotation_matrix, pg.rotation
+    n = 0
+    for ln in lines:
+        text = ln["text"].strip()
+        if not text:
+            continue
+        try:
+            x0, y0, x1, y1 = ln["bbox"]
+            h = max(y1 - y0, 4.0)
+            fs = h * 0.8
+            nat = font.text_length(text, fontsize=fs) or 1.0
+            sx = min(5.0, max(0.2, (x1 - x0) / nat))
+            pu = fitz.Point(x0, y1 - h * 0.2) * dm  # baseline start in unrotated page space
+            # on 90/270 pages the text runs along the unrotated y axis: stretch along ITS direction
+            m = fitz.Matrix(1, 0, 0, sx, 0, 0) if rot in (90, 270) else fitz.Matrix(sx, 0, 0, 1, 0, 0)
+            pg.insert_text(pu, text, fontsize=fs, fontname="zaiath", fontfile=fontfile, render_mode=3, rotate=rot, morph=(pu, m))
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+def ocr_worker(a):
+    """runs in a separate process (python zaia_pdf.py --ocr-worker ...): the window never freezes and can cancel"""
+    data_path, out_path, tessdata, lang, dpi, rot_json, pages_csv, pw = a[:8]
+
+    def say(msg):
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+    try:
+        doc = fitz.open(data_path)
+        if doc.needs_pass:
+            doc.authenticate(pw)
+        for i, deg in json.loads(rot_json).items():
+            pg = doc[int(i)]
+            pg.set_rotation((pg.rotation + deg) % 360)
+        res = {}
+        for p in [int(x) for x in pages_csv.split(",") if x != ""]:
+            say("PAGE %d" % p)
+            res[str(p)] = ocr_page_lines(doc[p], tessdata, lang, int(dpi))
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False)
+        say("DONE")
+        return 0
+    except Exception as e:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump({"error": "%s: %s" % (type(e).__name__, e)}, f, ensure_ascii=False)
+        return 1
+
+
 FORM_FONTS = ["TH SarabunPSK", "TH Sarabun New", "TH SarabunIT\u0e59", "Tahoma", "Leelawadee UI", "Segoe UI"]
 
 
@@ -518,6 +638,7 @@ class Canvas(QGraphicsView):
         self.form_items = []
         self._ed = None
         self._wpage = None
+        self.ocr = {}       # page -> {'lines': [...]} reviewed OCR text, written as an invisible layer when saving
         self.cur_page = 0   # page the rotate buttons act on (the one at the centre of the view)
         self.cur = self.start = self.pg = self.erasing = None
         self.timer = QTimer(self, singleShot=True, interval=40)
@@ -531,7 +652,7 @@ class Canvas(QGraphicsView):
         self.sc.clear()
         self.doc, self.data, self.password = doc, data, password
         self.pages, self.undo, self.redo, self.rot, self.cur_page = [], [], [], {}, 0
-        self.form, self.form_items, self._ed = {}, [], None
+        self.form, self.form_items, self._ed, self.ocr = {}, [], None, {}
         self._layout()
         self._build_form()
         self.resetTransform()
@@ -577,6 +698,7 @@ class Canvas(QGraphicsView):
         pg = self.doc[i]
         pg.set_rotation((pg.rotation + deg) % 360)
         self.rot[i] = (self.rot.get(i, 0) + deg) % 360
+        self.ocr.pop(i, None)  # its text positions were for the old orientation
         self._layout()
         for j, items in groups.items():
             new_o = self.pages[j].geom().topLeft()
@@ -1084,6 +1206,12 @@ class Canvas(QGraphicsView):
                 pg.insert_image(rect, stream=self._overlay_png(i), rotate=pg.rotation, overlay=True)
             else:
                 pg.show_pdf_page(rect, o, n, rotate=pg.rotation)
+        done = []
+        for i in sorted(self.ocr):  # reviewed OCR text -> invisible, searchable layer (the scan itself is untouched)
+            if self.ocr[i]["lines"] and OCR_FONT.exists() and add_text_layer(out[i], self.ocr[i]["lines"], str(OCR_FONT)):
+                done.append(i + 1)
+        if done:
+            notes.append("เพิ่มชั้นข้อความที่ค้นหา/คัดลอกได้ (จาก OCR ที่ตรวจทานแล้ว) ในหน้า %s โดยภาพสแกนไม่เปลี่ยน" % ", ".join(map(str, done)))
         if self._strip_xfa(out):
             notes.append("ลบ XFA (ฟอร์มไดนามิกของ Adobe) แล้ว: สคริปต์ XFA (เช่น ปฏิทินแบบไดนามิก) อาจใช้ไม่ได้")
         return out, notes
@@ -1169,7 +1297,7 @@ class Canvas(QGraphicsView):
         still_bad = []
         for attempt in (1, 2):
             out, notes = self._compose(flatten, ov, idxs, modes)
-            data = out.tobytes(garbage=3, deflate=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+            data = out.tobytes(garbage=4 if self.ocr else 3, deflate=True, encryption=fitz.PDF_ENCRYPT_KEEP)
             bad = self._verify(data, idxs, flatten) if idxs else []
             self._log("compose %d: pages %s modes %s -> not visible on %s" % (attempt, [i + 1 for i in idxs], modes or "vector", [i + 1 for i in bad] or "none"))
             if not bad:
@@ -1345,6 +1473,11 @@ ICONS = {
     "rotr": _rot(True), "rotl": _rot(False), "saveas": _saveas,
     "form": lambda p, c: (p.drawRoundedRect(QRectF(5, 4, 22, 24), 2, 2), p.drawRect(QRectF(9, 9, 5, 5)),
                           p.drawLine(17, 11, 24, 11), p.drawRect(QRectF(9, 18, 5, 5)), p.drawLine(17, 20, 24, 20)),
+    "ocr": lambda p, c: (p.drawLine(4, 9, 4, 4), p.drawLine(4, 4, 9, 4), p.drawLine(23, 4, 28, 4), p.drawLine(28, 4, 28, 9),
+                         p.drawLine(4, 23, 4, 28), p.drawLine(4, 28, 9, 28), p.drawLine(23, 28, 28, 28), p.drawLine(28, 28, 28, 23),
+                         p.drawLine(9, 11, 23, 11), p.drawLine(9, 16, 23, 16), p.drawLine(9, 21, 17, 21)),
+    "export": lambda p, c: (p.drawRect(QRectF(5, 12, 22, 16)), p.drawLine(16, 18, 16, 3), _poly(p, [(10, 8), (16, 2), (22, 8)], False)),
+    "clear": lambda p, c: (p.drawLine(7, 7, 25, 25), p.drawLine(25, 7, 7, 25)),
     "image": lambda p, c: (p.drawRoundedRect(QRectF(4, 6, 24, 20), 2, 2), p.drawEllipse(QPointF(11, 13), 2.2, 2.2),
                            _poly(p, [(5, 25), (13, 17), (18, 22), (22, 18), (27, 25)], False)),
     "select": lambda p, c: _poly(p, [(8, 4), (8, 25), (13, 20), (17, 28), (20, 27), (16, 19), (23, 19)], True, c),
@@ -1937,6 +2070,117 @@ class PrintDialog(QDialog):
         self.accept()
 
 
+class OcrReview(QDialog):
+    """check what OCR read, line by line, against the scan itself, before anything is written into the file"""
+
+    def __init__(self, doc, results, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ตรวจทานข้อความที่ OCR อ่านได้ - " + APP_NAME)
+        self.resize(1020, 800)
+        self.rows = {}  # page -> [(checkbox, line edit, bbox, has_digits)]
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 12, 14, 12)
+        warn = QLabel("⚠ OCR ภาษาไทยอ่านผิดได้ โดยเฉพาะ <b>เลขไทย วันที่ เลขที่หนังสือ เลขบัตร</b> และวรรณยุกต์ "
+                      "เทียบข้อความกับภาพของแต่ละแถว (<b>แถวสีเหลือง = มีตัวเลข</b>) แล้วแก้ให้ตรงก่อนยืนยัน • "
+                      "ติ๊กออกแถวที่เป็นลายมือ/ตราประทับ/ขยะ • ข้อมูลทั้งหมดอยู่ในเครื่องนี้เท่านั้น")
+        warn.setWordWrap(True)
+        warn.setStyleSheet("background:#fff4c2;color:#5b4400;border:1px solid #e0b800;border-radius:6px;padding:8px;font-size:13px")
+        v.addWidget(warn)
+        tabs = QTabWidget()
+        fnt = QFont(form_font())
+        fnt.setPointSize(13)
+        for p in sorted(results):
+            pix = doc[p].get_pixmap(dpi=150, alpha=False)
+            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+            box = QWidget()
+            bl = QVBoxLayout(box)
+            bl.setSpacing(8)
+            self.rows[p] = []
+            for ln in results[p]:
+                x0, y0, x1, y1 = [c * 150 / 72 for c in ln["bbox"]]
+                crop = img.copy(QRectF(x0 - 8, y0 - 6, x1 - x0 + 16, y1 - y0 + 12).toRect().intersected(img.rect()))
+                if crop.width() > 900:
+                    crop = crop.scaledToWidth(900, Qt.SmoothTransformation)
+                digits, noise = line_flags(ln["text"])
+                fr = QFrame()
+                fr.setStyleSheet("QFrame{background:%s;border:1px solid %s;border-radius:6px}QLabel,QCheckBox{border:0;background:transparent}" % (
+                    "#fff4c2" if digits else "#ffffff", "#e0b800" if digits else "#d1d5db"))
+                h = QHBoxLayout(fr)
+                chk = QCheckBox()
+                chk.setChecked(not noise)
+                chk.setToolTip("ติ๊กออก = ไม่ใช้แถวนี้ (ลายมือ/ตราประทับ/ขยะ)")
+                col = QVBoxLayout()
+                im = QLabel()
+                im.setPixmap(QPixmap.fromImage(crop))
+                ed = QLineEdit(ln["text"])
+                ed.setFont(fnt)
+                ed.setStyleSheet("QLineEdit{background:#ffffff;color:#111827;border:1px solid #9ca3af;min-height:30px;padding:0 6px}")
+                col.addWidget(im)
+                col.addWidget(ed)
+                if digits:
+                    col.addWidget(QLabel("⚠ มีตัวเลข: เทียบกับภาพให้ตรงทุกหลัก"))
+                if noise:
+                    col.addWidget(QLabel("น่าจะเป็นลายมือ/ตรา/ขยะ จึงไม่ติ๊กใช้ให้ (ติ๊กเองได้)"))
+                h.addWidget(chk, 0, Qt.AlignTop)
+                h.addLayout(col, 1)
+                bl.addWidget(fr)
+                chk.toggled.connect(self._sync)
+                ed.textChanged.connect(self._sync)
+                self.rows[p].append((chk, ed, ln["bbox"], digits))
+            bl.addStretch()
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setWidget(box)
+            tabs.addTab(sa, "หน้า %d" % (p + 1))
+        v.addWidget(tabs, 1)
+        self.ack = QCheckBox("ฉันตรวจเทียบแถวสีเหลือง (ตัวเลข/วันที่) ทุกแถวที่เลือกใช้กับภาพแล้ว")
+        self.ack.toggled.connect(self._sync)
+        v.addWidget(self.ack)
+        bar = QHBoxLayout()
+        self.ok = QPushButton("ใช้ข้อความนี้ (เพิ่มชั้นข้อความที่ค้นหาได้ในไฟล์)")
+        self.ok.setObjectName("primary")
+        self.ok.clicked.connect(self.accept)
+        txt = QPushButton("บันทึกเป็น .txt…")
+        txt.setObjectName("plain")
+        txt.clicked.connect(self.save_txt)
+        cp = QPushButton("คัดลอกทั้งหมด")
+        cp.setObjectName("plain")
+        cp.clicked.connect(lambda: QApplication.clipboard().setText(self.all_text()))
+        cancel = QPushButton("ยกเลิก")
+        cancel.setObjectName("plain")
+        cancel.clicked.connect(self.reject)
+        for w in (self.ok, txt, cp):
+            bar.addWidget(w)
+        bar.addStretch()
+        bar.addWidget(cancel)
+        v.addLayout(bar)
+        self._sync()
+
+    def _needs_ack(self):
+        return any(c.isChecked() and d and e.text().strip() for rows in self.rows.values() for c, e, _, d in rows)
+
+    def _sync(self, *_):
+        need = self._needs_ack()
+        self.ack.setEnabled(need)
+        self.ok.setEnabled(not need or self.ack.isChecked())
+
+    def result(self):
+        return {p: [{"bbox": b, "text": ocr_clean(e.text())} for c, e, b, _ in rows if c.isChecked() and e.text().strip()]
+                for p, rows in self.rows.items()}
+
+    def all_text(self):
+        parts = []
+        for p, lines in sorted(self.result().items()):
+            if lines:
+                parts.append("--- หน้า %d ---\n%s" % (p + 1, "\n".join(l["text"] for l in lines)))
+        return "\n\n".join(parts)
+
+    def save_txt(self):
+        f, _ = QFileDialog.getSaveFileName(self, "บันทึกข้อความ", "ocr.txt", "Text (*.txt)")
+        if f:
+            Path(f).write_text(self.all_text(), encoding="utf-8-sig")
+
+
 class Main(QMainWindow):
     TOOLS = ["select", "pen", "highlight", "eraser", "text", "form"]
     LINES = [("1.0", 100), ("1.15", 115), ("1.5", 150), ("2.0", 200), ("2.5", 250), ("3.0", 300)]
@@ -2052,7 +2296,7 @@ class Main(QMainWindow):
                         big("พอดีกว้าง", "fit", self.cv.fit_width, "Ctrl+0")),
                   Group("ช่วยเหลือ", big("อัปเดต", "update", self.check_update),
                         big("เกี่ยวกับ", "info", lambda: QMessageBox.information(
-                            self, APP_NAME, "%s %s\nเพิ่มปากกา/ไฮไลท์/ข้อความ/รูปภาพทับบน PDF กรอกฟอร์ม และหมุนหน้า\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
+                            self, APP_NAME, "%s %s\nเพิ่มปากกา/ไฮไลท์/ข้อความ/รูปภาพทับบน PDF กรอกฟอร์ม หมุนหน้า และ OCR\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
             hh.addWidget(g)
         hh.addStretch()
 
@@ -2121,14 +2365,31 @@ class Main(QMainWindow):
                                             [lab("สูตร/สคริปต์ของฟอร์ม (เช่น คำนวณอัตโนมัติ) ไม่ถูกรัน")])))
         fh.addStretch()
 
+        ocrp = QWidget()
+        ocrp.setObjectName("panel")
+        oh = QHBoxLayout(ocrp)
+        oh.setContentsMargins(6, 0, 6, 0)
+        oh.setSpacing(0)
+        self.ocr_lbl = lab("ยังไม่มีผล OCR")
+        oh.addWidget(Group("อ่านข้อความจากภาพสแกน (OCR)", big("OCR\nหน้านี้", "ocr", lambda: self.ocr_pages(False)),
+                           big("OCR\nทุกหน้า", "ocr", lambda: self.ocr_pages(True)),
+                           rows([lab("ทำงานในเครื่อง ไม่ส่งภาพออกไปไหน")], [lab("หน้าละราว 5–10 วินาที ยกเลิกได้")],
+                                [lab("หมุนหน้าให้ตั้งตรงก่อนทำ OCR")])))
+        oh.addWidget(Group("ผลลัพธ์", big("ส่งออก\nข้อความ .txt", "export", self.export_ocr_text),
+                           big("ล้างผล\nOCR", "clear", self.clear_ocr), rows([self.ocr_lbl])))
+        oh.addWidget(Group("ข้อควรระวัง", rows([lab("เลขไทย/วันที่/เลขที่หนังสือ/เลขบัตร อ่านผิดบ่อย")],
+                                               [lab("ทุกครั้งมีหน้าตรวจทาน เทียบข้อความกับภาพทีละแถว")],
+                                               [lab("ภาพสแกนในไฟล์ไม่ถูกเปลี่ยน แค่เพิ่มชั้นข้อความที่มองไม่เห็น")])))
+        oh.addStretch()
+
         self.pages = QStackedWidget()
         self.pages.setFixedHeight(146)
-        for p in (home, ins, rotp, draw, txt, formp):
+        for p in (home, ins, rotp, draw, txt, formp, ocrp):
             self.pages.addWidget(p)
         self.tabs = QTabBar()
         self.tabs.setDrawBase(False)
         self.tabs.setExpanding(False)
-        for n in ("หน้าแรก", "แทรก", "หมุนหน้า", "วาด", "ข้อความ", "ฟอร์ม"):
+        for n in ("หน้าแรก", "แทรก", "หมุนหน้า", "วาด", "ข้อความ", "ฟอร์ม", "OCR"):
             self.tabs.addTab(n)
         self.tabs.currentChanged.connect(self.pages.setCurrentIndex)
         ribbon = QWidget()
@@ -2255,6 +2516,129 @@ class Main(QMainWindow):
         self.path, self.dirty = f, False
         self.setWindowTitle("%s - %s" % (Path(f).name, APP_NAME))
         self._form_info()
+        self._ocr_info()
+
+    # ---- OCR
+    def _ocr_info(self):
+        pg = sorted(self.cv.ocr)
+        self.ocr_lbl.setText("มีผล OCR ในหน้า: " + ", ".join(str(i + 1) for i in pg) if pg else "ยังไม่มีผล OCR")
+
+    def _run_ocr_job(self, pages, tessdata):
+        """OCR in a separate process with progress + cancel; returns {page: lines} or None"""
+        tmp = tempfile.mkdtemp(prefix="zaia_ocr_")
+        inp, outp = os.path.join(tmp, "in.pdf"), os.path.join(tmp, "out.json")
+        proc = None
+        try:
+            with open(inp, "wb") as f:
+                f.write(self.cv.data)
+            exe = sys.executable
+            if exe.lower().endswith("pythonw.exe"):
+                exe = exe[:-5] + ".exe"  # pythonw has no stdout for the progress lines
+            proc = QProcess(self)
+            proc.setProgram(exe)
+            proc.setArguments([str(Path(__file__).resolve()), "--ocr-worker", inp, outp, tessdata, "tha", "300",
+                               json.dumps({str(k): v for k, v in self.cv.rot.items()}),
+                               ",".join(str(p) for p in pages), self.cv.password])
+            prog = QProgressDialog("กำลังอ่านข้อความจากภาพ (OCR)…\nข้อมูลทั้งหมดอยู่ในเครื่องนี้", "ยกเลิก", 0, len(pages), self)
+            prog.setWindowTitle(APP_NAME)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setMinimumDuration(0)
+            prog.setValue(0)
+            state = {"cancel": False}
+
+            def on_out():
+                for ln in bytes(proc.readAllStandardOutput()).decode("utf-8", "replace").splitlines():
+                    if ln.startswith("PAGE "):
+                        p = int(ln.split()[1])
+                        prog.setLabelText("กำลังอ่านหน้า %d …\nข้อมูลทั้งหมดอยู่ในเครื่องนี้" % (p + 1))
+                        prog.setValue(pages.index(p) if p in pages else 0)
+            loop = QEventLoop()
+            proc.readyReadStandardOutput.connect(on_out)
+            proc.finished.connect(loop.quit)
+            proc.errorOccurred.connect(lambda *_: loop.quit())
+            prog.canceled.connect(lambda: (state.__setitem__("cancel", True), proc.kill()))
+            proc.start()
+            loop.exec()
+            try:
+                prog.canceled.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            canceled = state["cancel"] or prog.wasCanceled()  # (cancel() called directly does not emit the signal)
+            for sig in (proc.readyReadStandardOutput, proc.finished, proc.errorOccurred):
+                try:
+                    sig.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+            prog.close()
+            prog.deleteLater()
+            if canceled:
+                if proc.state() != QProcess.NotRunning:
+                    proc.kill()
+                    proc.waitForFinished(3000)
+                return None
+            if proc.error() == QProcess.FailedToStart:
+                QMessageBox.critical(self, APP_NAME, "เริ่มตัว OCR ไม่ได้:\n" + exe)
+                return None
+            data = {}
+            if os.path.exists(outp):
+                data = json.loads(Path(outp).read_text(encoding="utf-8"))
+            if proc.exitCode() != 0 or "error" in data or not data:
+                err = data.get("error") or bytes(proc.readAllStandardError()).decode("utf-8", "replace")[-400:] or "ไม่ทราบสาเหตุ"
+                QMessageBox.critical(self, APP_NAME, "OCR ไม่สำเร็จ:\n" + err)
+                return None
+            return {int(k): v for k, v in data.items()}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if proc is not None:
+                proc.deleteLater()
+
+    def ocr_pages(self, everything=False):
+        cv = self.cv
+        if not cv.doc:
+            return
+        td = ocr_tessdata()
+        if not td:
+            return QMessageBox.warning(self, APP_NAME, "ไม่พบไฟล์ภาษา OCR (tessdata\\tha.traineddata) ในโฟลเดอร์โปรแกรม\nกด \"อัปเดต\" หรือติดตั้งโปรแกรมใหม่")
+        pages = list(range(len(cv.pages))) if everything else [cv.cur_page]
+        has_text = [i for i in pages if len(cv.doc[i].get_text().strip()) >= 40]
+        if has_text and QMessageBox.question(
+                self, APP_NAME, "หน้า %s มีข้อความอยู่แล้ว (ไม่ใช่ภาพสแกนล้วน)\nทำ OCR หน้าเหล่านี้ต่อไหม? (ตอบ No = ข้ามหน้าเหล่านี้)" % ", ".join(str(i + 1) for i in has_text),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            pages = [i for i in pages if i not in has_text]
+        if not pages:
+            return
+        results = self._run_ocr_job(pages, td)
+        if not results:
+            return
+        dlg = OcrReview(cv.doc, results, self)
+        ok = dlg.exec() == QDialog.Accepted
+        res = dlg.result() if ok else {}
+        dlg.deleteLater()  # many child widgets: free them now instead of at exit
+        if not ok:
+            return
+        for p, lines in res.items():
+            if lines:
+                cv.ocr[p] = {"lines": lines}
+            else:
+                cv.ocr.pop(p, None)
+        cv.changed.emit()
+        self._ocr_info()
+        self.statusBar().showMessage("เก็บผล OCR แล้ว: จะเพิ่มเป็นชั้นข้อความที่ค้นหาได้ตอนบันทึก", 8000)
+
+    def export_ocr_text(self):
+        if not self.cv.ocr:
+            return QMessageBox.information(self, APP_NAME, "ยังไม่มีผล OCR ที่ตรวจทานแล้ว กด \"OCR หน้านี้\" ก่อน")
+        p = Path(self.path or "document.pdf")
+        f, _ = QFileDialog.getSaveFileName(self, "ส่งออกข้อความ", str(p.with_name(p.stem + "_ocr.txt")), "Text (*.txt)")
+        if f:
+            body = "\n\n".join("--- หน้า %d ---\n%s" % (i + 1, "\n".join(l["text"] for l in self.cv.ocr[i]["lines"]))
+                                for i in sorted(self.cv.ocr))
+            Path(f).write_text(body, encoding="utf-8-sig")
+            self.statusBar().showMessage("ส่งออกข้อความแล้ว: " + f, 6000)
+
+    def clear_ocr(self):
+        self.cv.ocr.clear()
+        self._ocr_info()
 
     def _form_info(self):
         n = len(self.cv.form_items)
@@ -2266,11 +2650,15 @@ class Main(QMainWindow):
     def rotate(self, deg, everything=False):
         if not self.cv.doc:
             return
+        lost = [i + 1 for i in sorted(self.cv.ocr) if everything or i == self.cv.cur_page]
+        if lost:
+            self.statusBar().showMessage("ผล OCR ของหน้า %s ถูกล้างเพราะหมุนหน้า ให้ทำ OCR ใหม่หลังหมุน" % ", ".join(map(str, lost)), 10000)
         if everything:
             for i in range(len(self.cv.pages)):
                 self.cv.rotate_page(i, deg)
         else:
             self.cv.rotate_page(self.cv.cur_page, deg)
+        self._ocr_info()
 
     def insert_image(self, path=None):
         if not self.cv.doc:
@@ -2494,4 +2882,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--ocr-worker" in sys.argv:  # background OCR process (see Main._run_ocr_job)
+        sys.exit(ocr_worker(sys.argv[sys.argv.index("--ocr-worker") + 1:]))
     main()

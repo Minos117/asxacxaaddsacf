@@ -1,5 +1,5 @@
 #define AppName "ZAIA PDF"
-#define AppVersion "1.1.1"
+#define AppVersion "1.2.0"
 
 [Setup]
 AppId={{8F3A6C2E-1B7D-4E95-A4C0-5D2E9B7F1A63}
@@ -26,6 +26,8 @@ Source: "zaia_pdf.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "zaia.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "logo.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "setup_rev.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "tessdata\*"; DestDir: "{app}\tessdata"; Flags: ignoreversion
+Source: "fonts\*"; DestDir: "{app}\fonts"; Flags: ignoreversion
 Source: "runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -34,6 +36,7 @@ Name: "{autodesktop}\ZAIA PDF"; Filename: "{app}\ZAIA_PDF.exe"; IconFilename: "{
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\.venv"
+Type: files; Name: "{app}\zaia.log"
 Type: files; Name: "{app}\crash.log"
 Type: files; Name: "{app}\start.log"
 Type: filesandordirs; Name: "{app}\__pycache__"
