@@ -1,5 +1,5 @@
 # ZAIA PDF - PDF annotator (PySide6 + PyMuPDF). Adds ink/highlight/text on top of pages.
-import sys, os, re, json, time, shutil, hashlib, tempfile, threading, urllib.request, urllib.parse
+import sys, os, re, json, math, time, shutil, hashlib, tempfile, threading, urllib.request, urllib.parse
 from pathlib import Path
 import pymupdf as fitz
 from PySide6.QtCore import (Qt, QPointF, QRectF, QSizeF, QSize, QMarginsF, QTimer, QBuffer, QIODevice,
@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QWidgetAction, QSlider)
 from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 
-APP_VER = "0.9.3"
+APP_VER = "1.0.0"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -142,6 +142,12 @@ class PageItem(QGraphicsRectItem):
         if self.scale_key:
             self.pix.setPixmap(QPixmap())
             self.scale_key = 0
+
+    def mark(self, on):
+        """green frame = the page the rotate buttons act on"""
+        pen = QPen(QColor("#16A34A"), 3)
+        pen.setCosmetic(True)
+        self.setPen(pen if on else QPen(Qt.NoPen))
 
 
 class Grip(QGraphicsRectItem):
@@ -272,6 +278,50 @@ class ZText(QGraphicsTextItem):
         self.canvas.text_done(self)
 
 
+class ImgGrip(QGraphicsRectItem):
+    """green square at the bottom-right corner of a selected image: drag = resize (keeps proportions)"""
+    def __init__(self, parent):
+        super().__init__(-7, -7, 14, 14, parent)
+        self.setBrush(QColor("#16A34A"))
+        self.setPen(QPen(QColor("#ffffff"), 1.5))
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+        self.setCursor(Qt.SizeFDiagCursor)
+        self.setZValue(20)
+        self.hide()
+
+    def mousePressEvent(self, e):
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        p = self.parentItem()
+        v = e.scenePos() - p.pos()
+        a = math.radians(-p.rotation())  # into the image's own axes
+        vx, vy = v.x() * math.cos(a) - v.y() * math.sin(a), v.x() * math.sin(a) + v.y() * math.cos(a)
+        w0, h0 = p.pixmap().width(), p.pixmap().height()
+        p.setScale(max(0.02, (vx * w0 + vy * h0) / (w0 * w0 + h0 * h0)))
+
+    def mouseReleaseEvent(self, e):
+        self.parentItem().canvas.changed.emit()
+
+
+class ZImage(QGraphicsPixmapItem):
+    def __init__(self, canvas, page, pixmap, scale):
+        super().__init__(pixmap)
+        self.canvas = canvas
+        self.setTransformationMode(Qt.SmoothTransformation)
+        self.setData(0, "ann")
+        self.setData(1, page)
+        self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsMovable)
+        self.setScale(scale)
+        self.grip = ImgGrip(self)
+        self.grip.setPos(pixmap.width(), pixmap.height())
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemSelectedHasChanged:
+            self.grip.setVisible(bool(value))
+        return super().itemChange(change, value)
+
+
 class Canvas(QGraphicsView):
     changed = Signal()
     pageInfo = Signal(int, int)
@@ -296,6 +346,8 @@ class Canvas(QGraphicsView):
         self.tx_stretch = self.tx_line = self.tx_weight = 100
         self.undo, self.redo = [], []
         self.notes = []
+        self.rot = {}       # extra page rotation (deg, clockwise) chosen in the app
+        self.cur_page = 0   # page the rotate buttons act on (the one at the centre of the view)
         self.cur = self.start = self.pg = self.erasing = None
         self.timer = QTimer(self, singleShot=True, interval=40)
         self.timer.timeout.connect(self.refresh)
@@ -303,22 +355,100 @@ class Canvas(QGraphicsView):
         self.set_tool("select")
 
     # ---- document
-    def set_doc(self, doc, data, password=""):
+    def set_doc(self, doc, data, password="", keep=None):
+        """keep=(zoom, vscroll, hscroll) restores the view (used after overwrite-save)"""
         self.sc.clear()
         self.doc, self.data, self.password = doc, data, password
-        self.pages, self.undo, self.redo = [], [], []
-        rects = [p.rect for p in doc]
+        self.pages, self.undo, self.redo, self.rot, self.cur_page = [], [], [], {}, 0
+        self._layout()
+        self.resetTransform()
+        self.zoom = 1.0
+        if keep:
+            self.set_zoom(keep[0])
+            self.verticalScrollBar().setValue(keep[1])
+            self.horizontalScrollBar().setValue(keep[2])
+        else:
+            QTimer.singleShot(0, self.first_view)
+
+    def _layout(self):
+        rects = [p.rect for p in self.doc]
         mw = max(r.width for r in rects)
         y = 0
         for i, r in enumerate(rects):
-            it = PageItem(i, r.width, r.height, (mw - r.width) / 2, y)
-            self.sc.addItem(it)
-            self.pages.append(it)
+            if i < len(self.pages):
+                it = self.pages[i]
+                it.setRect(0, 0, r.width, r.height)
+                it.setPos((mw - r.width) / 2, y)
+                it.scale_key = 0
+                it.pix.setPixmap(QPixmap())
+            else:
+                it = PageItem(i, r.width, r.height, (mw - r.width) / 2, y)
+                self.sc.addItem(it)
+                self.pages.append(it)
             y += r.height + GAP
         self.sc.setSceneRect(-GAP, -GAP, mw + 2 * GAP, y + GAP)
-        self.resetTransform()
-        self.zoom = 1.0
-        QTimer.singleShot(0, self.first_view)
+
+    def rotate_page(self, i, deg):
+        """rotate page i by deg (90/180/270, clockwise); everything added on it turns with it"""
+        deg %= 360
+        if not self.doc or not deg:
+            return
+        self.sc.clearSelection()
+        self.sc.clearFocus()
+        old_o = [p.sceneBoundingRect().topLeft() for p in self.pages]
+        old_wh = [(p.rect().width(), p.rect().height()) for p in self.pages]
+        groups = {}
+        for it in self.sc.items():
+            if it.data(0) == "ann":
+                groups.setdefault(self.ann_page(it), []).append(it)
+        pg = self.doc[i]
+        pg.set_rotation((pg.rotation + deg) % 360)
+        self.rot[i] = (self.rot.get(i, 0) + deg) % 360
+        self._layout()
+        for j, items in groups.items():
+            new_o = self.pages[j].sceneBoundingRect().topLeft()
+            W, H = old_wh[j]
+            m = QTransform.fromTranslate(-old_o[j].x(), -old_o[j].y())
+            if j == i:
+                m = m * {90: QTransform(0, 1, -1, 0, H, 0), 180: QTransform(-1, 0, 0, -1, W, H),
+                         270: QTransform(0, -1, 1, 0, 0, W)}[deg]
+            m = m * QTransform.fromTranslate(new_o.x(), new_o.y())
+            for it in items:
+                if isinstance(it, QGraphicsPathItem):  # ink: geometry lives in scene coordinates
+                    path = m.map(it.mapToScene(it.path()))
+                    it.setPos(0, 0)
+                    it.setPath(path)
+                elif isinstance(it, QGraphicsRectItem):  # highlight
+                    r = m.map(it.mapToScene(it.rect())).boundingRect()
+                    it.setPos(0, 0)
+                    it.setRect(r)
+                else:  # text box / image: origin point + rotation
+                    it.setPos(m.map(it.pos()))
+                    if j == i:
+                        it.setRotation((it.rotation() + deg) % 360)
+        self.undo, self.redo = [], []  # earlier steps no longer match the new page geometry
+        self.changed.emit()
+        self.timer.start()
+        self.ensureVisible(self.pages[i], 20, 20)
+
+    def add_image(self, path):
+        img = QImage(path)
+        if img.isNull():
+            raise ValueError("เปิดไฟล์รูปไม่ได้: " + path)
+        if max(img.width(), img.height()) > 2400:  # keep memory and PDF size sane
+            img = img.scaled(2400, 2400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pg = self.pages[self.cur_page]
+        r = pg.sceneBoundingRect()
+        vis = self.mapToScene(self.viewport().rect()).boundingRect().intersected(r)
+        c = vis.center() if not vis.isEmpty() else r.center()
+        s = min(1.0, r.width() * 0.4 / img.width(), r.height() * 0.6 / img.height())
+        it = ZImage(self, pg.idx, QPixmap.fromImage(img), s)
+        it.setPos(c - QPointF(img.width() * s / 2, img.height() * s / 2))
+        it.setZValue(10)
+        self.sc.addItem(it)
+        it.setSelected(True)
+        self._push(("add", [it]))
+        return it
 
     def set_zoom(self, z):
         z = max(0.2, min(z, 8))
@@ -348,6 +478,9 @@ class Canvas(QGraphicsView):
                 p.clear()
         c = vr.center().y()
         n = min(self.pages, key=lambda p: abs(p.sceneBoundingRect().center().y() - c))
+        self.cur_page = n.idx
+        for p in self.pages:
+            p.mark(p is n and len(self.pages) > 1)
         self.pageInfo.emit(n.idx + 1, len(self.pages))
 
     def resizeEvent(self, e):
@@ -420,7 +553,7 @@ class Canvas(QGraphicsView):
             self.erasing = []
             return self._erase(pos)
         if self.tool == "text":
-            if isinstance(self.itemAt(e.position().toPoint()), (ZText, Grip)):
+            if isinstance(self.itemAt(e.position().toPoint()), (ZText, Grip, ImgGrip)):
                 return super().mousePressEvent(e)
             if pg:
                 t = ZText(self, pg.idx)
@@ -583,6 +716,8 @@ class Canvas(QGraphicsView):
         if out.needs_pass:
             out.authenticate(self.password)
         self.notes = []
+        for i, deg in self.rot.items():
+            out[i].set_rotation((out[i].rotation + deg) % 360)
         if flatten and any(True for pg in out if pg.first_widget):
             out.bake(annots=False, widgets=True)
             self.notes.append("ทำฟอร์มเป็นข้อความถาวรแล้ว: ช่องกรอก/ปฏิทิน/ดรอปลิสต์ในไฟล์ใหม่จะกรอกต่อไม่ได้ (ไฟล์ต้นฉบับไม่เปลี่ยน)")
@@ -685,6 +820,22 @@ def _zoom(plus):
     return f
 
 
+def _rot(cw):
+    def f(p, c):
+        if not cw:
+            p.translate(32, 0)
+            p.scale(-1, 1)
+        p.drawArc(QRectF(7, 8, 18, 18), 90 * 16, -270 * 16)  # clockwise 3/4 circle from the top
+        _poly(p, [(3, 21), (7, 17), (11, 21)], False)       # arrow head at its end (left, pointing up)
+    return f
+
+
+def _saveas(p, c):
+    ICONS["save"](p, c)
+    p.drawLine(24, 22, 30, 22)
+    p.drawLine(27, 19, 27, 25)
+
+
 ICONS = {
     "open": lambda p, c: _poly(p, [(3, 8), (12, 8), (15, 11), (28, 11), (28, 26), (3, 26)]),
     "save": lambda p, c: (p.drawRoundedRect(QRectF(5, 5, 22, 22), 2, 2), p.drawRect(QRectF(10, 5, 11, 7)),
@@ -692,6 +843,9 @@ ICONS = {
     "print": lambda p, c: (p.drawRect(QRectF(4, 11, 24, 12)), p.drawRect(QRectF(9, 4, 14, 7)),
                            p.drawRect(QRectF(9, 18, 14, 9))),
     "undo": _undo, "redo": _redo,
+    "rotr": _rot(True), "rotl": _rot(False), "saveas": _saveas,
+    "image": lambda p, c: (p.drawRoundedRect(QRectF(4, 6, 24, 20), 2, 2), p.drawEllipse(QPointF(11, 13), 2.2, 2.2),
+                           _poly(p, [(5, 25), (13, 17), (18, 22), (22, 18), (27, 25)], False)),
     "select": lambda p, c: _poly(p, [(8, 4), (8, 25), (13, 20), (17, 28), (20, 27), (16, 19), (23, 19)], True, c),
     "pen": lambda p, c: (_poly(p, [(5, 27), (7, 19), (21, 5), (27, 11), (13, 25)]), p.drawLine(19, 7, 25, 13)),
     "marker": lambda p, c: (_poly(p, [(10, 17), (20, 6), (27, 13), (17, 24)]), p.drawLine(4, 28, 15, 28)),
@@ -1110,7 +1264,8 @@ class Main(QMainWindow):
         hh.setContentsMargins(6, 0, 6, 0)
         hh.setSpacing(0)
         for g in (Group("ไฟล์", big("เปิด", "open", self.open_dialog, "Ctrl+O"),
-                        big("บันทึกเป็น", "save", self.save_as, "Ctrl+S"),
+                        big("บันทึก", "save", self.save_over, "Ctrl+S"),
+                        big("บันทึกเป็น", "saveas", self.save_as, "Ctrl+Shift+S"),
                         big("พิมพ์", "print", self.print_pdf, "Ctrl+P")),
                   Group("แก้ไข", big("ย้อนกลับ", "undo", self.cv.do_undo, "Ctrl+Z"),
                         big("ทำซ้ำ", "redo", self.cv.do_redo, "Ctrl+Y")),
@@ -1119,9 +1274,35 @@ class Main(QMainWindow):
                         big("พอดีกว้าง", "fit", self.cv.fit_width, "Ctrl+0")),
                   Group("ช่วยเหลือ", big("อัปเดต", "update", self.check_update),
                         big("เกี่ยวกับ", "info", lambda: QMessageBox.information(
-                            self, APP_NAME, "%s %s (Beta)\nเพิ่มปากกา/ไฮไลท์/ข้อความทับบน PDF\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
+                            self, APP_NAME, "%s %s\nเพิ่มปากกา/ไฮไลท์/ข้อความ/รูปภาพทับบน PDF และหมุนหน้า\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
             hh.addWidget(g)
         hh.addStretch()
+
+        ins = QWidget()
+        ins.setObjectName("panel")
+        ih = QHBoxLayout(ins)
+        ih.setContentsMargins(6, 0, 6, 0)
+        ih.setSpacing(0)
+        ih.addWidget(Group("รูปภาพ", big("แทรกรูป", "image", self.insert_image, "Ctrl+I"),
+                           rows([lab("เลือกไฟล์รูป (PNG/JPG/...) แล้วลากย้ายได้")],
+                                [lab("ลากสี่เหลี่ยมเขียวมุมขวาล่างเพื่อย่อ/ขยาย")],
+                                [lab("ลากไฟล์รูปมาวางบนหน้าต่างก็ได้")])))
+        ih.addStretch()
+
+        rotp = QWidget()
+        rotp.setObjectName("panel")
+        rh = QHBoxLayout(rotp)
+        rh.setContentsMargins(6, 0, 6, 0)
+        rh.setSpacing(0)
+        for g in (Group("หมุนหน้าที่เลือก", big("หมุนซ้าย 90°", "rotl", lambda: self.rotate(270)),
+                        big("หมุนขวา 90°", "rotr", lambda: self.rotate(90)),
+                        big("หมุน 180°", "rotr", lambda: self.rotate(180))),
+                  Group("หมุนทุกหน้า", big("ซ้าย 90°", "rotl", lambda: self.rotate(270, True)),
+                        big("ขวา 90°", "rotr", lambda: self.rotate(90, True))),
+                  Group("วิธีใช้", rows([lab("หน้าที่เลือก = หน้าที่มีกรอบเขียว")], [lab("อยู่กลางจอ (เลื่อนเพื่อเปลี่ยนหน้า)")],
+                                        [lab("ของที่เพิ่มไว้บนหน้านั้นหมุนตามไปด้วย")]))):
+            rh.addWidget(g)
+        rh.addStretch()
 
         draw = QWidget()
         draw.setObjectName("panel")
@@ -1151,12 +1332,12 @@ class Main(QMainWindow):
 
         self.pages = QStackedWidget()
         self.pages.setFixedHeight(146)
-        for p in (home, draw, txt):
+        for p in (home, ins, rotp, draw, txt):
             self.pages.addWidget(p)
         self.tabs = QTabBar()
         self.tabs.setDrawBase(False)
         self.tabs.setExpanding(False)
-        for n in ("หน้าแรก", "วาด", "ข้อความ"):
+        for n in ("หน้าแรก", "แทรก", "หมุนหน้า", "วาด", "ข้อความ"):
             self.tabs.addTab(n)
         self.tabs.currentChanged.connect(self.pages.setCurrentIndex)
         ribbon = QWidget()
@@ -1182,7 +1363,7 @@ class Main(QMainWindow):
         self.tool_btns[self.TOOLS.index(k)].setChecked(True)
         self.cv.set_tool(k)
         self.update_opts()
-        tab = {"pen": 1, "highlight": 1, "text": 2}.get(k)  # ribbon follows the tool
+        tab = {"pen": 3, "highlight": 3, "text": 4}.get(k)  # ribbon follows the tool
         if tab is not None:
             self.tabs.setCurrentIndex(tab)
 
@@ -1191,7 +1372,7 @@ class Main(QMainWindow):
         if len(sel) == 1:
             self.load_text_style(sel[0])
         if self.cv.tool == "select" and sel:
-            self.tabs.setCurrentIndex(2)  # contextual: a text box is selected
+            self.tabs.setCurrentIndex(4)  # contextual: a text box is selected
 
     def reset_width(self):
         for it in self.cv.sc.selectedItems():
@@ -1283,7 +1464,100 @@ class Main(QMainWindow):
         self.path, self.dirty = f, False
         self.setWindowTitle("%s - %s" % (Path(f).name, APP_NAME))
 
-    def save_as(self):
+    def rotate(self, deg, everything=False):
+        if not self.cv.doc:
+            return
+        if everything:
+            for i in range(len(self.cv.pages)):
+                self.cv.rotate_page(i, deg)
+        else:
+            self.cv.rotate_page(self.cv.cur_page, deg)
+
+    def insert_image(self, path=None):
+        if not self.cv.doc:
+            return QMessageBox.information(self, APP_NAME, "เปิดไฟล์ PDF ก่อน แล้วค่อยแทรกรูป")
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "เลือกรูป", "", "รูปภาพ (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff)")
+        if not path:
+            return
+        try:
+            item = self.cv.add_image(path)
+        except Exception as e:
+            return QMessageBox.critical(self, APP_NAME, "แทรกรูปไม่ได้:\n%s: %s" % (type(e).__name__, e))
+        self.pick("select")  # ready to drag / resize
+        item.setSelected(True)  # (switching tool clears the selection) keep the green resize handle visible
+        self.statusBar().showMessage("แทรกรูปแล้ว: ลากย้าย • ลากสี่เหลี่ยมเขียวมุมขวาล่างเพื่อย่อ/ขยาย • Delete = ลบ", 8000)
+
+    def _ask_form(self):
+        """True = flatten form fields, False = keep them, None = cancel"""
+        hits = self.cv.form_hits()
+        if not hits:
+            return False
+        m = QMessageBox(self)
+        m.setWindowTitle(APP_NAME)
+        m.setIcon(QMessageBox.Question)
+        m.setText("สิ่งที่เพิ่มทับ %d ช่องฟอร์ม (เช่น ปฏิทินเลือกวันที่ / ดรอปลิสต์)" % hits)
+        m.setInformativeText("โปรแกรมอ่าน PDF วาดช่องฟอร์มทับบนสุดเสมอ ข้อความจะถูกบังถ้าไม่ทำฟอร์มเป็นข้อความถาวร\n\n"
+                             "• ทำเป็นข้อความถาวร (แนะนำ): แสดงชัวร์ แต่ช่องกรอกในไฟล์ใหม่จะกรอกต่อไม่ได้\n"
+                             "• คงช่องกรอกไว้: ยังกรอกต่อได้ แต่ที่ทับช่องอาจถูกบัง")
+        b1 = m.addButton("ทำเป็นข้อความถาวร (แนะนำ)", QMessageBox.AcceptRole)
+        b2 = m.addButton("คงช่องกรอกไว้", QMessageBox.DestructiveRole)
+        m.addButton("ยกเลิก", QMessageBox.RejectRole)
+        m.exec()
+        if m.clickedButton() is b1:
+            return True
+        return False if m.clickedButton() is b2 else None
+
+    def _after_save(self, f):
+        self.dirty = False
+        self.statusBar().showMessage("บันทึกแล้ว: " + f, 6000)
+        if self.cv.notes:
+            QMessageBox.information(self, APP_NAME, "บันทึกแล้ว มีข้อสังเกต:\n\n" + "\n".join(self.cv.notes))
+
+    def save_over(self):
+        """Save = overwrite the opened file (previous version kept as <name>.bak)"""
+        if not self.cv.doc:
+            return
+        p = Path(self.path)
+        m = QMessageBox(self)
+        m.setWindowTitle(APP_NAME)
+        m.setIcon(QMessageBox.Question)
+        m.setText("บันทึกทับไฟล์เดิม?\n" + str(p))
+        m.setInformativeText("ไฟล์เดิมจะถูกสำรองไว้เป็น %s.bak (ทับ .bak เก่าถ้ามี)" % p.name)
+        b1 = m.addButton("บันทึกทับ", QMessageBox.AcceptRole)
+        b2 = m.addButton("บันทึกเป็นไฟล์ใหม่…", QMessageBox.ActionRole)
+        m.addButton("ยกเลิก", QMessageBox.RejectRole)
+        m.exec()
+        if m.clickedButton() is b2:
+            return self.save_as(force_dialog=True)
+        if m.clickedButton() is not b1:
+            return
+        flatten = self._ask_form()
+        if flatten is None:
+            return
+        try:
+            if p.exists():
+                shutil.copy2(p, p.with_name(p.name + ".bak"))
+            self.cv.save(str(p), flatten)
+        except PermissionError as e:
+            return QMessageBox.critical(self, APP_NAME, "เขียนไฟล์ไม่ได้ (ไฟล์อาจถูกเปิดค้างในโปรแกรมอื่น หรือไม่มีสิทธิ์):\n%s\n\nปิดไฟล์นั้นก่อน หรือใช้ \"บันทึกเป็น\"" % e)
+        except Exception as e:
+            return QMessageBox.critical(self, APP_NAME, "บันทึกไม่สำเร็จ:\n%s: %s" % (type(e).__name__, e))
+        notes = list(self.cv.notes)
+        # the saved file now contains everything: reload it so nothing is drawn twice on the next save
+        try:
+            data = p.read_bytes()
+            doc = fitz.open("pdf", data)
+            if doc.needs_pass:
+                doc.authenticate(self.cv.password)
+            keep = (self.cv.zoom, self.cv.verticalScrollBar().value(), self.cv.horizontalScrollBar().value())
+            self.cv.set_doc(doc, data, self.cv.password, keep)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, "บันทึกแล้ว แต่โหลดไฟล์กลับมาไม่ได้: %s\nกรุณาเปิดไฟล์ใหม่" % e)
+        self.cv.notes = notes
+        self._after_save(str(p))
+
+    def save_as(self, force_dialog=False):
         if not self.cv.doc:
             return
         p = Path(self.path)
@@ -1292,36 +1566,16 @@ class Main(QMainWindow):
             return
         if not f.lower().endswith(".pdf"):
             f += ".pdf"
-        if Path(f).resolve() == p.resolve() and QMessageBox.question(
-                self, APP_NAME, "เขียนทับไฟล์ต้นฉบับ? ย้อนกลับไม่ได้",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+        if Path(f).resolve() == p.resolve():
+            return self.save_over()
+        flatten = self._ask_form()
+        if flatten is None:
             return
-        flatten = False
-        hits = self.cv.form_hits()
-        if hits:
-            m = QMessageBox(self)
-            m.setWindowTitle(APP_NAME)
-            m.setIcon(QMessageBox.Question)
-            m.setText("ข้อความที่เพิ่มทับ %d ช่องฟอร์ม (เช่น ปฏิทินเลือกวันที่ / ดรอปลิสต์)" % hits)
-            m.setInformativeText("โปรแกรมอ่าน PDF วาดช่องฟอร์มทับบนสุดเสมอ ข้อความจะถูกบังถ้าไม่ทำฟอร์มเป็นข้อความถาวร\n\n"
-                                 "• ทำเป็นข้อความถาวร (แนะนำ): ข้อความแสดงชัวร์ แต่ช่องกรอกในไฟล์ใหม่จะกรอกต่อไม่ได้\n"
-                                 "• คงช่องกรอกไว้: ยังกรอกต่อได้ แต่ข้อความที่ทับช่องอาจถูกบัง")
-            b1 = m.addButton("ทำเป็นข้อความถาวร (แนะนำ)", QMessageBox.AcceptRole)
-            b2 = m.addButton("คงช่องกรอกไว้", QMessageBox.DestructiveRole)
-            m.addButton("ยกเลิก", QMessageBox.RejectRole)
-            m.exec()
-            if m.clickedButton() is b1:
-                flatten = True
-            elif m.clickedButton() is not b2:
-                return
         try:
             self.cv.save(f, flatten)
         except Exception as e:
             return QMessageBox.critical(self, APP_NAME, "บันทึกไม่สำเร็จ:\n%s: %s" % (type(e).__name__, e))
-        self.dirty = False
-        self.statusBar().showMessage("บันทึกแล้ว: " + f, 6000)
-        if self.cv.notes:
-            QMessageBox.information(self, APP_NAME, "บันทึกแล้ว มีข้อสังเกต:\n\n" + "\n".join(self.cv.notes))
+        self._after_save(f)
 
     def print_pdf(self):
         """print preview (shows exactly what will be printed) -> its Print button opens the printer dialog"""
@@ -1349,8 +1603,11 @@ class Main(QMainWindow):
 
     def dropEvent(self, e):
         for u in e.mimeData().urls():
-            if u.toLocalFile().lower().endswith(".pdf"):
-                return self.open_path(u.toLocalFile())
+            f = u.toLocalFile()
+            if f.lower().endswith(".pdf"):
+                return self.open_path(f)
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")):
+                return self.insert_image(f)
 
     def closeEvent(self, e):
         e.accept() if self.confirm_discard() else e.ignore()
