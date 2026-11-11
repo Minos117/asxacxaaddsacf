@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QWidgetAction, QSlider)
 from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 
-APP_VER = "1.0.0"
+APP_VER = "1.0.1"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -142,6 +142,10 @@ class PageItem(QGraphicsRectItem):
         if self.scale_key:
             self.pix.setPixmap(QPixmap())
             self.scale_key = 0
+
+    def geom(self):
+        """the page rectangle in scene units (sceneBoundingRect() is inflated by the green frame's pen)"""
+        return QRectF(self.pos(), self.rect().size())
 
     def mark(self, on):
         """green frame = the page the rotate buttons act on"""
@@ -395,7 +399,7 @@ class Canvas(QGraphicsView):
             return
         self.sc.clearSelection()
         self.sc.clearFocus()
-        old_o = [p.sceneBoundingRect().topLeft() for p in self.pages]
+        old_o = [p.geom().topLeft() for p in self.pages]
         old_wh = [(p.rect().width(), p.rect().height()) for p in self.pages]
         groups = {}
         for it in self.sc.items():
@@ -406,7 +410,7 @@ class Canvas(QGraphicsView):
         self.rot[i] = (self.rot.get(i, 0) + deg) % 360
         self._layout()
         for j, items in groups.items():
-            new_o = self.pages[j].sceneBoundingRect().topLeft()
+            new_o = self.pages[j].geom().topLeft()
             W, H = old_wh[j]
             m = QTransform.fromTranslate(-old_o[j].x(), -old_o[j].y())
             if j == i:
@@ -438,7 +442,7 @@ class Canvas(QGraphicsView):
         if max(img.width(), img.height()) > 2400:  # keep memory and PDF size sane
             img = img.scaled(2400, 2400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         pg = self.pages[self.cur_page]
-        r = pg.sceneBoundingRect()
+        r = pg.geom()
         vis = self.mapToScene(self.viewport().rect()).boundingRect().intersected(r)
         c = vis.center() if not vis.isEmpty() else r.center()
         s = min(1.0, r.width() * 0.4 / img.width(), r.height() * 0.6 / img.height())
@@ -472,12 +476,12 @@ class Canvas(QGraphicsView):
         ext = vr.adjusted(0, -vr.height(), 0, vr.height())
         s = self.zoom * self.devicePixelRatioF()
         for p in self.pages:
-            if p.sceneBoundingRect().intersects(ext):
+            if p.geom().intersects(ext):
                 p.render(self.doc, s)
             else:
                 p.clear()
         c = vr.center().y()
-        n = min(self.pages, key=lambda p: abs(p.sceneBoundingRect().center().y() - c))
+        n = min(self.pages, key=lambda p: abs(p.geom().center().y() - c))
         self.cur_page = n.idx
         for p in self.pages:
             p.mark(p is n and len(self.pages) > 1)
@@ -508,11 +512,11 @@ class Canvas(QGraphicsView):
 
     def page_at(self, pt):
         for p in self.pages:
-            if p.sceneBoundingRect().contains(pt):
+            if p.geom().contains(pt):
                 return p
 
     def _clamp(self, pt):
-        r = self.pg.sceneBoundingRect()
+        r = self.pg.geom()
         return QPointF(min(max(pt.x(), r.left()), r.right()), min(max(pt.y(), r.top()), r.bottom()))
 
     def _push(self, op):
@@ -676,7 +680,7 @@ class Canvas(QGraphicsView):
         painter = None
         try:
             for n, i in enumerate(idxs):
-                r = self.pages[i].sceneBoundingRect()
+                r = self.pages[i].geom()
                 w.setPageSize(QPageSize(QSizeF(r.width(), r.height()), QPageSize.Point))
                 if n == 0:
                     painter = QPainter(w)
@@ -699,7 +703,7 @@ class Canvas(QGraphicsView):
         for it in self.sc.items():
             if it.data(0) == "ann":
                 i = self.ann_page(it)
-                o = self.pages[i].sceneBoundingRect().topLeft()
+                o = self.pages[i].geom().topLeft()
                 r = it.sceneBoundingRect().translated(-o)
                 rects.setdefault(i, []).append(fitz.Rect(r.left(), r.top(), r.right(), r.bottom()))
         for i, rs in rects.items():
@@ -708,30 +712,136 @@ class Canvas(QGraphicsView):
                     n += 1
         return n
 
-    def build(self, flatten=False):
-        """flatten=True turns form fields into plain page content so added text always shows ABOVE them
-        (viewers draw live form fields on top of everything else)"""
-        ov, idxs = self.overlay_pdf()
+    def _base(self, flatten=False):
+        """original pages + the rotations chosen in the app (+ flattened form fields), no overlay yet"""
         out = fitz.open("pdf", self.data)
         if out.needs_pass:
             out.authenticate(self.password)
-        self.notes = []
         for i, deg in self.rot.items():
             out[i].set_rotation((out[i].rotation + deg) % 360)
+        notes = []
         if flatten and any(True for pg in out if pg.first_widget):
             out.bake(annots=False, widgets=True)
-            self.notes.append("ทำฟอร์มเป็นข้อความถาวรแล้ว: ช่องกรอก/ปฏิทิน/ดรอปลิสต์ในไฟล์ใหม่จะกรอกต่อไม่ได้ (ไฟล์ต้นฉบับไม่เปลี่ยน)")
-        if ov:
-            o = fitz.open("pdf", ov)
-            for n, i in enumerate(idxs):
-                pg = out[i]
-                if pg.rotation:
-                    pg.show_pdf_page(pg.rect * pg.derotation_matrix, o, n, rotate=pg.rotation)
-                else:
-                    pg.show_pdf_page(pg.rect, o, n)
+            notes.append("ทำฟอร์มเป็นข้อความถาวรแล้ว: ช่องกรอก/ปฏิทิน/ดรอปลิสต์ในไฟล์ใหม่จะกรอกต่อไม่ได้")
+        return out, notes
+
+    def _compose(self, flatten, ov, idxs, modes):
+        """modes[page] = 'vector' (real text/fonts, default) or 'raster' (300 dpi image of the added items)"""
+        out, notes = self._base(flatten)
+        o = fitz.open("pdf", ov) if ov else None
+        for n, i in enumerate(idxs):
+            pg = out[i]
+            rect = pg.rect * pg.derotation_matrix if pg.rotation else pg.rect
+            if modes.get(i) == "raster":
+                pg.insert_image(rect, stream=self._overlay_png(i), rotate=pg.rotation, overlay=True)
+            else:
+                pg.show_pdf_page(rect, o, n, rotate=pg.rotation)
         if self._strip_xfa(out):
-            self.notes.append("ลบ XFA (ฟอร์มไดนามิกของ Adobe) แล้ว: Adobe จึงแสดงข้อความที่เพิ่มได้ แต่สคริปต์ XFA (เช่น ปฏิทินแบบไดนามิก) อาจใช้ไม่ได้")
-        return out
+            notes.append("ลบ XFA (ฟอร์มไดนามิกของ Adobe) แล้ว: สคริปต์ XFA (เช่น ปฏิทินแบบไดนามิก) อาจใช้ไม่ได้")
+        return out, notes
+
+    def _overlay_image(self, i, scale):
+        """transparent QImage of everything added on page i (what the screen shows, without the PDF page)"""
+        self.sc.clearSelection()
+        self.sc.clearFocus()
+        r = self.pages[i].geom()
+        img = QImage(max(1, math.ceil(r.width() * scale)), max(1, math.ceil(r.height() * scale)), QImage.Format_ARGB32)
+        img.fill(Qt.transparent)
+        for p in self.pages:
+            p.setVisible(False)
+        try:
+            pt = QPainter(img)
+            pt.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+            self.sc.render(pt, QRectF(0, 0, img.width(), img.height()), r)
+            pt.end()
+        finally:
+            for p in self.pages:
+                p.setVisible(True)
+        return img
+
+    def _overlay_png(self, i):
+        r = self.pages[i].geom()
+        img = self._overlay_image(i, min(300 / 72, 4096 / max(r.width(), r.height())))
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(buf.data())
+
+    def _verify(self, data, idxs, flatten):
+        """re-open the PDF we are about to write and check that the added items are really visible in it
+        (a viewer-independent renderer, like the one used for reloading and printing). Returns the bad pages."""
+        bad = []
+        doc = fitz.open("pdf", data)
+        if doc.needs_pass:
+            doc.authenticate(self.password)
+        base, _ = self._base(flatten)
+        S = 1.5
+        for i in idxs:
+            ov = self._overlay_image(i, S)
+            w_, h_, bpl = ov.width(), ov.height(), ov.bytesPerLine()
+            px = bytes(ov.constBits())
+            a = doc[i].get_pixmap(matrix=fitz.Matrix(S, S), alpha=False)
+            b = base[i].get_pixmap(matrix=fitz.Matrix(S, S), alpha=False)
+            if abs(a.width - w_) > 3 or abs(a.height - h_) > 3 or (a.width, a.height) != (b.width, b.height):
+                bad.append(i)  # the saved page does not even have the expected size
+                continue
+            w_, h_ = min(w_, a.width), min(h_, a.height)  # renderers round sizes differently by a pixel
+            sa, sb = a.samples, b.samples
+            seen = lost = 0
+            for y in range(0, h_, 2):
+                for x in range(0, w_, 2):
+                    o = y * bpl + x * 4
+                    if px[o + 3] < 200:
+                        continue
+                    k = y * a.stride + x * 3
+                    ink = (px[o + 2], px[o + 1], px[o])  # ARGB32 little endian = B,G,R,A
+                    if sum(abs(ink[c] - sb[k + c]) for c in range(3)) < 90:
+                        continue  # item colour ~ page colour here: nothing to compare
+                    seen += 1
+                    if sum(abs(sa[k + c] - sb[k + c]) for c in range(3)) < 45:
+                        lost += 1
+            if seen >= 20 and lost / seen > 0.8:
+                bad.append(i)
+        return bad
+
+    def _log(self, msg):
+        try:
+            with open(APP_DIR / "zaia.log", "a", encoding="utf-8") as f:
+                f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        except OSError:
+            pass
+
+    def make_pdf(self, flatten=False):
+        """bytes of the finished PDF. Added items are first embedded as real vector text; we then verify the result and
+        switch the pages where they are not visible to a high-resolution image, so nothing is silently lost."""
+        ov, idxs = self.overlay_pdf()
+        modes = {}
+        if idxs and getattr(self, "force_raster", False):
+            modes = {i: "raster" for i in idxs}
+        still_bad = []
+        for attempt in (1, 2):
+            out, notes = self._compose(flatten, ov, idxs, modes)
+            data = out.tobytes(garbage=3, deflate=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+            bad = self._verify(data, idxs, flatten) if idxs else []
+            self._log("compose %d: pages %s modes %s -> not visible on %s" % (attempt, [i + 1 for i in idxs], modes or "vector", [i + 1 for i in bad] or "none"))
+            if not bad:
+                still_bad = []
+                break
+            still_bad = bad
+            if attempt == 1:
+                modes.update({i: "raster" for i in bad})
+        self.notes = notes
+        if still_bad:
+            self.notes.append("คำเตือน: ตรวจแล้วยังไม่พบสิ่งที่เพิ่มบนหน้า %s ในไฟล์ที่บันทึก (ดูรายละเอียดใน zaia.log)" % ", ".join(str(i + 1) for i in still_bad))
+            try:
+                if ov:
+                    (APP_DIR / "last_overlay.pdf").write_bytes(ov)
+            except OSError:
+                pass
+        elif any(m == "raster" for m in modes.values()):
+            pages = ", ".join(str(i + 1) for i, m in sorted(modes.items()) if m == "raster")
+            self.notes.append("หน้า %s: ข้อความ/รูปที่เพิ่มถูกบันทึกเป็นภาพความละเอียดสูง (300 dpi) เพราะแบบตัวอักษรจริงแสดงไม่ขึ้นในไฟล์นี้ ภาพจะค้นหา/คัดลอกข้อความไม่ได้" % pages)
+        return data
 
     @staticmethod
     def _strip_xfa(out):
@@ -751,14 +861,16 @@ class Canvas(QGraphicsView):
         return False
 
     def save(self, path, flatten=False):
-        out = self.build(flatten)
+        data = self.make_pdf(flatten)
         tmp = path + ".tmp"
-        out.save(tmp, garbage=3, deflate=True, encryption=fitz.PDF_ENCRYPT_KEEP)
-        out.close()
+        with open(tmp, "wb") as f:
+            f.write(data)
         os.replace(tmp, path)
 
     def print_to(self, printer, a, b):
-        d = self.build(True)  # printing: fields become plain content so nothing hides the added text
+        d = fitz.open("pdf", self.make_pdf(True))  # printing: fields become plain content, items verified visible
+        if d.needs_pass:
+            d.authenticate(self.password)
         s = min(printer.resolution(), 300) / 72  # cap dpi: 1200dpi page = hundreds of MB
         painter = None
         for n, i in enumerate(range(a - 1, b)):
