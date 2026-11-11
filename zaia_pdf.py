@@ -6,17 +6,17 @@ from PySide6.QtCore import (Qt, QPointF, QRectF, QSizeF, QSize, QMarginsF, QTime
                             Signal, QObject, QSettings)
 from PySide6.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPalette,
                            QPen, QPixmap, QPageSize, QPageLayout, QPdfWriter, QIcon, QKeySequence,
-                           QTransform, QTextCursor, QTextBlockFormat, QPolygonF, QIntValidator)
+                           QTransform, QTextCursor, QTextBlockFormat, QPolygonF, QIntValidator, QFontDatabase)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphicsScene, QGraphicsItem,
                                QGraphicsRectItem, QGraphicsPixmapItem, QGraphicsPathItem,
                                QGraphicsTextItem, QPushButton, QColorDialog,
                                QFontComboBox, QLabel, QFileDialog, QMessageBox, QInputDialog,
                                QLineEdit, QToolButton, QFrame, QVBoxLayout, QHBoxLayout,
                                QWidget, QStackedWidget, QButtonGroup, QComboBox, QTabBar, QMenu, QGridLayout,
-                               QWidgetAction, QSlider, QDialog)
+                               QWidgetAction, QSlider, QDialog, QPlainTextEdit)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 
-APP_VER = "1.0.3"
+APP_VER = "1.1.0"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -326,6 +326,142 @@ class ZImage(QGraphicsPixmapItem):
         return super().itemChange(change, value)
 
 
+FORM_FONTS = ["TH SarabunPSK", "TH Sarabun New", "TH SarabunIT\u0e59", "Tahoma", "Leelawadee UI", "Segoe UI"]
+
+
+def form_font():
+    have = set(QFontDatabase.families())
+    return next((f for f in FORM_FONTS if f in have), QApplication.font().family())
+
+
+def field_png(wpt, hpt, text, size, color, align, multiline, fill, border, bwidth):
+    """400 dpi picture of a filled-in field (Thai shaped by Qt, independent of the PDF renderer's fonts)"""
+    S = 400 / 72
+    img = QImage(max(1, math.ceil(wpt * S)), max(1, math.ceil(hpt * S)), QImage.Format_ARGB32)
+    img.setDotsPerMeterX(2835)  # 72 dpi: 1 pt = 1 px before the scale below
+    img.setDotsPerMeterY(2835)
+    img.fill(QColor.fromRgbF(*fill) if fill else Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing | QPainter.SmoothPixmapTransform)
+    p.scale(S, S)
+    if border and bwidth:
+        p.setPen(QPen(QColor.fromRgbF(*border), bwidth))
+        p.drawRect(QRectF(bwidth / 2, bwidth / 2, wpt - bwidth, hpt - bwidth))
+    f = QFont(form_font())
+    f.setPointSizeF(size)
+    p.setFont(f)
+    p.setPen(QColor.fromRgbF(*color))
+    flags = {1: Qt.AlignHCenter, 2: Qt.AlignRight}.get(align, Qt.AlignLeft)
+    flags |= (Qt.AlignTop | Qt.TextWordWrap) if multiline else Qt.AlignVCenter
+    area = QRectF(2, 1, max(1, wpt - 4), max(1, hpt - 2))
+    p.setClipRect(area)
+    p.drawText(area, int(flags), text)
+    p.end()
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    img.save(buf, "PNG")
+    return bytes(buf.data())
+
+
+def apply_value(doc, page_no, xref, value):
+    """set one form field's value (clearing needs reset(): update() ignores an empty value). For text-like fields
+    the appearance is replaced by our own picture, so Thai always shows fully whatever PyMuPDF/MuPDF version runs."""
+    page = doc[page_no]
+    w = next((x for x in page.widgets() if x.xref == xref), None)
+    if w is None:
+        return
+    ftype = w.field_type
+    empty = value in ("", None)
+    if empty:
+        w.reset()
+    else:
+        w.field_value = value
+        w.update()
+    if empty or ftype not in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+        return
+    r = w.rect
+    wpt, hpt = r.width, r.height
+    multi = bool(w.field_flags & fitz.PDF_TX_FIELD_IS_MULTILINE) and ftype == fitz.PDF_WIDGET_TYPE_TEXT
+    size = w.text_fontsize if w.text_fontsize and w.text_fontsize > 0 else (12 if multi else min(max(hpt * 0.62, 6), 16))
+    q = doc.xref_get_key(xref, "Q")
+    png = field_png(wpt, hpt, str(value), size, w.text_color or (0, 0, 0), int(q[1]) if q[0] == "int" else 0,
+                    multi, w.fill_color, w.border_color, w.border_width or 0)
+    mini = fitz.open()
+    mini.new_page(width=wpt, height=hpt).insert_image(fitz.Rect(0, 0, wpt, hpt), stream=png)
+    tmp = doc.new_page(-1, width=wpt, height=hpt)  # scratch page: turns the picture into a form XObject
+    form = tmp.show_pdf_page(tmp.rect, mini, 0)
+    doc.delete_page(len(doc) - 1)
+    doc.xref_set_key(xref, "AP", "<</N %d 0 R>>" % form)
+
+
+class FormHit(QGraphicsRectItem):
+    """clickable area over one PDF form field (only visible/active in the form tool)"""
+    def __init__(self, parent, rect, info):
+        super().__init__(rect, parent)
+        self.info = info  # {xref, page, kind}
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setZValue(5)
+        self._style(False)
+
+    def _style(self, hover):
+        pen = QPen(QColor("#2563eb"), 1.2 if hover else 0.8)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(QColor(37, 99, 235, 70 if hover else 32))
+
+    def hoverEnterEvent(self, e):
+        self._style(True)
+
+    def hoverLeaveEvent(self, e):
+        self._style(False)
+
+
+class _EditMixin:
+    done = Signal(str, int)  # text, 0 = commit / 1 = next / -1 = previous / 9 = cancel
+
+    def _finish(self, move):
+        if not getattr(self, "_fin", False):
+            self._fin = True
+            self.done.emit(self.value_text(), move)
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k in (Qt.Key_Return, Qt.Key_Enter) and (not self.multiline or e.modifiers() & Qt.ControlModifier):
+            self._finish(0)
+        elif k == Qt.Key_Escape:
+            self._finish(9)
+        elif k == Qt.Key_Tab:
+            self._finish(1)
+        elif k == Qt.Key_Backtab:
+            self._finish(-1)
+        else:
+            super().keyPressEvent(e)
+
+    def focusNextPrevChild(self, nxt):
+        return False  # let Tab reach keyPressEvent
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self._finish(0)
+
+
+class FieldEdit(_EditMixin, QLineEdit):
+    done = Signal(str, int)
+    multiline = False
+
+    def value_text(self):
+        return self.text()
+
+
+class FieldEditML(_EditMixin, QPlainTextEdit):
+    done = Signal(str, int)
+    multiline = True
+
+    def value_text(self):
+        return self.toPlainText()
+
+
 class Canvas(QGraphicsView):
     changed = Signal()
     pageInfo = Signal(int, int)
@@ -351,6 +487,10 @@ class Canvas(QGraphicsView):
         self.undo, self.redo = [], []
         self.notes = []
         self.rot = {}       # extra page rotation (deg, clockwise) chosen in the app
+        self.form = {}      # xref -> (page, value) of form fields filled in the app (re-applied when saving)
+        self.form_items = []
+        self._ed = None
+        self._wpage = None
         self.cur_page = 0   # page the rotate buttons act on (the one at the centre of the view)
         self.cur = self.start = self.pg = self.erasing = None
         self.timer = QTimer(self, singleShot=True, interval=40)
@@ -364,7 +504,9 @@ class Canvas(QGraphicsView):
         self.sc.clear()
         self.doc, self.data, self.password = doc, data, password
         self.pages, self.undo, self.redo, self.rot, self.cur_page = [], [], [], {}, 0
+        self.form, self.form_items, self._ed = {}, [], None
         self._layout()
+        self._build_form()
         self.resetTransform()
         self.zoom = 1.0
         if keep:
@@ -431,6 +573,7 @@ class Canvas(QGraphicsView):
                     if j == i:
                         it.setRotation((it.rotation() + deg) % 360)
         self.undo, self.redo = [], []  # earlier steps no longer match the new page geometry
+        self._build_form()
         self.changed.emit()
         self.timer.start()
         self.ensureVisible(self.pages[i], 20, 20)
@@ -503,7 +646,10 @@ class Canvas(QGraphicsView):
         self.tool = t
         self.sc.clearSelection()
         self.sc.clearFocus()
-        if t == "select":
+        self._close_editor()
+        for h in self.form_items:
+            h.setVisible(t == "form")
+        if t in ("select", "form"):
             self.setDragMode(QGraphicsView.ScrollHandDrag)
             self.viewport().unsetCursor()
         else:
@@ -526,12 +672,177 @@ class Canvas(QGraphicsView):
 
     def _apply(self, op, undo):
         kind, items = op
+        if kind == "form":
+            page, before, after = items
+            self._set_states(page, before if undo else after)
+            return
         add = (kind == "add") != undo
         for it in items:
             if add and it.scene() is None:
                 self.sc.addItem(it)
             elif not add and it.scene() is self.sc:
                 self.sc.removeItem(it)
+
+    # ---- PDF form fields (text, check boxes, radio buttons, drop-down lists)
+    KINDS = {fitz.PDF_WIDGET_TYPE_TEXT: "text", fitz.PDF_WIDGET_TYPE_CHECKBOX: "check",
+             fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "radio", fitz.PDF_WIDGET_TYPE_COMBOBOX: "combo",
+             fitz.PDF_WIDGET_TYPE_LISTBOX: "list"}
+
+    def _build_form(self):
+        for h in self.form_items:
+            if h.scene() is not None:
+                self.sc.removeItem(h)
+        self.form_items = []
+        for i, page in enumerate(self.doc):
+            for w in page.widgets():
+                kind = self.KINDS.get(w.field_type)
+                if not kind or w.field_flags & fitz.PDF_FIELD_IS_READ_ONLY:
+                    continue
+                r = fitz.Rect(w.rect * page.rotation_matrix)  # widget rects are in unrotated page space
+                r.normalize()
+                h = FormHit(self.pages[i], QRectF(r.x0, r.y0, r.width, r.height), {"xref": w.xref, "page": i, "kind": kind})
+                h.setVisible(self.tool == "form")
+                self.form_items.append(h)
+
+    def _widget(self, info):
+        # a widget is only usable while its page object is alive: keep that page referenced
+        self._wpage = page = self.doc[info["page"]]
+        for w in page.widgets():
+            if w.xref == info["xref"]:
+                return w
+
+    @staticmethod
+    def _on_state(w):
+        try:
+            return w.on_state() or "Yes"
+        except Exception:
+            return "Yes"
+
+    def _states(self, w, page):
+        """{xref: value} of this field (a whole group for radio buttons) - what undo/redo/save restore"""
+        if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+            return {x.xref: x.field_value for x in self.doc[page].widgets() if x.field_name == w.field_name}
+        return {w.xref: w.field_value}
+
+    def _set_states(self, page, states):
+        cur = {w.xref: w.field_value for w in self.doc[page].widgets() if w.xref in states}
+        for xref, val in states.items():
+            if cur.get(xref) != val:
+                apply_value(self.doc, page, xref, val)
+            self.form[xref] = (page, val)
+        self.pages[page].scale_key = 0  # re-render that page
+        self.timer.start()
+        self.changed.emit()
+
+    def set_field(self, info, value):
+        w = self._widget(info)
+        if w is None or w.field_value == value:
+            return
+        before = self._states(w, info["page"])
+        apply_value(self.doc, info["page"], info["xref"], value)
+        after = self._states(self._widget(info), info["page"])
+        for xref, val in after.items():
+            self.form[xref] = (info["page"], val)
+        self.pages[info["page"]].scale_key = 0
+        self.timer.start()
+        self._push(("form", (info["page"], before, after)))
+
+    def edit_field(self, hit):
+        info = hit.info
+        w = self._widget(info)
+        if w is None:
+            return
+        self._close_editor()
+        k = info["kind"]
+        if k == "check":
+            on = str(w.field_value) not in ("Off", "False", "")
+            self.set_field(info, "Off" if on else self._on_state(w))
+        elif k == "radio":
+            self.set_field(info, self._on_state(w))
+        elif k in ("combo", "list"):
+            self._choice_menu(hit, w)
+        else:
+            self._text_editor(hit, w)
+
+    def _choice_menu(self, hit, w):
+        cur = str(w.field_value or "")
+        m = QMenu(self)
+        acts = {}
+        for c in (w.choice_values or []):
+            exp, label = (c[0], c[-1]) if isinstance(c, (list, tuple)) else (c, c)
+            a = m.addAction(("✓  " if str(exp) == cur or label == cur else "     ") + str(label))
+            acts[a] = str(exp)
+        custom = None
+        if w.field_flags & fitz.PDF_CH_FIELD_IS_EDIT:
+            m.addSeparator()
+            custom = m.addAction("พิมพ์ค่าเอง…")
+        r = self.mapFromScene(hit.mapToScene(hit.rect())).boundingRect()
+        m.setMinimumWidth(max(120, r.width()))
+        chosen = []
+        m.triggered.connect(chosen.append)
+        a = m.exec(self.viewport().mapToGlobal(r.bottomLeft())) or (chosen[0] if chosen else None)
+        if a is None:
+            return
+        if a is custom:
+            txt, ok = QInputDialog.getText(self, "กรอกค่า", "ค่า:", text=cur)
+            if ok:
+                self.set_field(hit.info, txt)
+        else:
+            self.set_field(hit.info, acts[a])
+
+    def _text_editor(self, hit, w):
+        r = self.mapFromScene(hit.mapToScene(hit.rect())).boundingRect()
+        multi = bool(w.field_flags & fitz.PDF_TX_FIELD_IS_MULTILINE)
+        ed = FieldEditML(self.viewport()) if multi else FieldEdit(self.viewport())
+        f = QFont("Tahoma")
+        f.setPixelSize(max(9, int((w.text_fontsize * self.zoom) if w.text_fontsize and w.text_fontsize > 0
+                                  else (r.height() * 0.62 if not multi else 14 * self.zoom))))
+        ed.setFont(f)
+        ed.setStyleSheet("background:#ffffff;color:#111827;border:2px solid #16A34A;border-radius:2px;padding:0 3px")
+        if multi:
+            ed.setPlainText(str(w.field_value or ""))
+        else:
+            ed.setText(str(w.field_value or ""))
+            if w.text_maxlen and w.text_maxlen > 0:
+                ed.setMaxLength(w.text_maxlen)
+            ed.selectAll()
+        ed.setGeometry(r.adjusted(-1, -1, 1, 1))
+        ed.done.connect(lambda text, move, hit=hit: self._editor_done(hit, text, move))
+        ed.show()
+        ed.setFocus()
+        self._ed = ed
+
+    def _close_editor(self):
+        if self._ed is not None:
+            ed, self._ed = self._ed, None
+            try:
+                ed.done.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            ed.hide()
+            ed.deleteLater()
+
+    def _editor_done(self, hit, text, move):
+        ed, self._ed = self._ed, None
+        if ed is not None:
+            try:
+                ed.done.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            QTimer.singleShot(0, ed.deleteLater)
+            ed.hide()
+        if move != 9:
+            w = self._widget(hit.info)
+            if w is not None and w.text_maxlen and w.text_maxlen > 0:
+                text = text[:w.text_maxlen]
+            self.set_field(hit.info, text)
+        if move in (1, -1):
+            i = self.form_items.index(hit)
+            seq = (self.form_items[i + 1:] if move == 1 else self.form_items[:i][::-1])
+            nxt = next((h for h in seq if h.info["kind"] == "text"), None)
+            if nxt is not None:
+                self.ensureVisible(nxt)
+                QTimer.singleShot(0, lambda: self.edit_field(nxt))
 
     def do_undo(self):
         self.sc.clearFocus()
@@ -549,6 +860,11 @@ class Canvas(QGraphicsView):
             self.changed.emit()
 
     def mousePressEvent(self, e):
+        if self.tool == "form" and e.button() == Qt.LeftButton and self.doc:
+            it = self.itemAt(e.position().toPoint())
+            if isinstance(it, FormHit):
+                return self.edit_field(it)
+            return super().mousePressEvent(e)
         if e.button() != Qt.LeftButton or not self.doc or self.tool == "select":
             return super().mousePressEvent(e)
         pos = self.mapToScene(e.position().toPoint())
@@ -708,7 +1024,8 @@ class Canvas(QGraphicsView):
                 rects.setdefault(i, []).append(fitz.Rect(r.left(), r.top(), r.right(), r.bottom()))
         for i, rs in rects.items():
             for w in self.doc[i].widgets():
-                if any(w.rect.intersects(r) for r in rs):
+                wr = fitz.Rect(w.rect * self.doc[i].rotation_matrix)
+                if any(wr.intersects(r) for r in rs):
                     n += 1
         return n
 
@@ -717,6 +1034,10 @@ class Canvas(QGraphicsView):
         out = fitz.open("pdf", self.data)
         if out.needs_pass:
             out.authenticate(self.password)
+        for xref, (pno, val) in self.form.items():  # values typed/chosen in the app
+            cur = next((x.field_value for x in out[pno].widgets() if x.xref == xref), None)
+            if cur is not None and cur != val:
+                apply_value(out, pno, xref, val)
         for i, deg in self.rot.items():
             out[i].set_rotation((out[i].rotation + deg) % 360)
         notes = []
@@ -995,6 +1316,8 @@ ICONS = {
                            p.drawRect(QRectF(9, 18, 14, 9))),
     "undo": _undo, "redo": _redo,
     "rotr": _rot(True), "rotl": _rot(False), "saveas": _saveas,
+    "form": lambda p, c: (p.drawRoundedRect(QRectF(5, 4, 22, 24), 2, 2), p.drawRect(QRectF(9, 9, 5, 5)),
+                          p.drawLine(17, 11, 24, 11), p.drawRect(QRectF(9, 18, 5, 5)), p.drawLine(17, 20, 24, 20)),
     "image": lambda p, c: (p.drawRoundedRect(QRectF(4, 6, 24, 20), 2, 2), p.drawEllipse(QPointF(11, 13), 2.2, 2.2),
                            _poly(p, [(5, 25), (13, 17), (18, 22), (22, 18), (27, 25)], False)),
     "select": lambda p, c: _poly(p, [(8, 4), (8, 25), (13, 20), (17, 28), (20, 27), (16, 19), (23, 19)], True, c),
@@ -1224,7 +1547,7 @@ QComboBox QLineEdit{background:transparent;border:0;color:#111827;selection-back
 QComboBox QAbstractItemView{background:#ffffff;color:#111827;border:1px solid #16A34A;
   selection-background-color:#16A34A;selection-color:#ffffff;outline:0}
 QComboBox QAbstractItemView::item{min-height:30px;padding-left:10px}
-QMenu{background:#ffffff;color:#111827;border:1px solid #d1d5db;padding:4px}
+QMenu{background:#ffffff;color:#111827;border:1px solid #d1d5db;padding:4px;menu-scrollable:1}
 QMenu::item{padding:7px 26px;min-height:22px;font-size:13px}
 QMenu::item:selected{background:#16A34A;color:#ffffff}
 QMenu::separator{height:1px;background:#e5e7eb;margin:4px 8px}
@@ -1588,7 +1911,7 @@ class PrintDialog(QDialog):
 
 
 class Main(QMainWindow):
-    TOOLS = ["select", "pen", "highlight", "eraser", "text"]
+    TOOLS = ["select", "pen", "highlight", "eraser", "text", "form"]
     LINES = [("1.0", 100), ("1.15", 115), ("1.5", 150), ("2.0", 200), ("2.5", 250), ("3.0", 300)]
 
     def __init__(self):
@@ -1621,7 +1944,7 @@ class Main(QMainWindow):
         self.tool_btns = []
         for i, (k, txt, kind) in enumerate([("select", "เลือก/ย้าย", "select"), ("pen", "ปากกา", "pen"),
                                             ("highlight", "ไฮไลท์", "marker"), ("eraser", "ยางลบ", "eraser"),
-                                            ("text", "ข้อความ", "text")]):
+                                            ("text", "ข้อความ", "text"), ("form", "กรอกฟอร์ม", "form")]):
             b = big(txt, kind, lambda _=False, k=k: self.pick(k), "Ctrl+%d" % (i + 1), True, "tool")
             grp.addButton(b)
             tv.addWidget(b)
@@ -1702,7 +2025,7 @@ class Main(QMainWindow):
                         big("พอดีกว้าง", "fit", self.cv.fit_width, "Ctrl+0")),
                   Group("ช่วยเหลือ", big("อัปเดต", "update", self.check_update),
                         big("เกี่ยวกับ", "info", lambda: QMessageBox.information(
-                            self, APP_NAME, "%s %s\nเพิ่มปากกา/ไฮไลท์/ข้อความ/รูปภาพทับบน PDF และหมุนหน้า\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
+                            self, APP_NAME, "%s %s\nเพิ่มปากกา/ไฮไลท์/ข้อความ/รูปภาพทับบน PDF กรอกฟอร์ม และหมุนหน้า\nไม่แก้ข้อความเดิมใน PDF" % (APP_NAME, APP_VER))))):
             hh.addWidget(g)
         hh.addStretch()
 
@@ -1758,14 +2081,27 @@ class Main(QMainWindow):
             th.addWidget(g)
         th.addStretch()
 
+        formp = QWidget()
+        formp.setObjectName("panel")
+        fh = QHBoxLayout(formp)
+        fh.setContentsMargins(6, 0, 6, 0)
+        fh.setSpacing(0)
+        self.form_lbl = lab("")
+        fh.addWidget(Group("กรอกฟอร์ม", rows([self.form_lbl], [lab("คลิกช่องสีฟ้าเพื่อกรอก • ช่องติ๊ก/ปุ่มเลือก: คลิกเพื่อเปลี่ยน")],
+                                              [lab("ดรอปลิสต์ (เดือน/ปี/ตัวเลือก): คลิกแล้วเลือกจากรายการ")],
+                                              [lab("Enter = ตกลง • Tab = ช่องข้อความถัดไป • Esc = ยกเลิก")])))
+        fh.addWidget(Group("หมายเหตุ", rows([lab("ค่าที่กรอกบันทึกลงในช่องของไฟล์ (ยังแก้ไขต่อในโปรแกรมอื่นได้)")],
+                                            [lab("สูตร/สคริปต์ของฟอร์ม (เช่น คำนวณอัตโนมัติ) ไม่ถูกรัน")])))
+        fh.addStretch()
+
         self.pages = QStackedWidget()
         self.pages.setFixedHeight(146)
-        for p in (home, ins, rotp, draw, txt):
+        for p in (home, ins, rotp, draw, txt, formp):
             self.pages.addWidget(p)
         self.tabs = QTabBar()
         self.tabs.setDrawBase(False)
         self.tabs.setExpanding(False)
-        for n in ("หน้าแรก", "แทรก", "หมุนหน้า", "วาด", "ข้อความ"):
+        for n in ("หน้าแรก", "แทรก", "หมุนหน้า", "วาด", "ข้อความ", "ฟอร์ม"):
             self.tabs.addTab(n)
         self.tabs.currentChanged.connect(self.pages.setCurrentIndex)
         ribbon = QWidget()
@@ -1791,7 +2127,7 @@ class Main(QMainWindow):
         self.tool_btns[self.TOOLS.index(k)].setChecked(True)
         self.cv.set_tool(k)
         self.update_opts()
-        tab = {"pen": 3, "highlight": 3, "text": 4}.get(k)  # ribbon follows the tool
+        tab = {"pen": 3, "highlight": 3, "text": 4, "form": 5}.get(k)  # ribbon follows the tool
         if tab is not None:
             self.tabs.setCurrentIndex(tab)
 
@@ -1891,6 +2227,14 @@ class Main(QMainWindow):
             return QMessageBox.critical(self, APP_NAME, "เปิดไฟล์ไม่ได้:\n%s: %s" % (type(e).__name__, e))
         self.path, self.dirty = f, False
         self.setWindowTitle("%s - %s" % (Path(f).name, APP_NAME))
+        self._form_info()
+
+    def _form_info(self):
+        n = len(self.cv.form_items)
+        self.form_lbl.setText("พบช่องฟอร์ม %d ช่อง" % n if n else "ไฟล์นี้ไม่มีช่องฟอร์ม")
+        if n:
+            self.pick("form")  # open straight into fill-in mode
+            self.statusBar().showMessage("พบช่องฟอร์ม %d ช่อง: คลิกช่องสีฟ้าเพื่อกรอก (ใช้เครื่องมืออื่นทางซ้ายได้ตามปกติ)" % n, 10000)
 
     def rotate(self, deg, everything=False):
         if not self.cv.doc:

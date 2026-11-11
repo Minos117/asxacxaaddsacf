@@ -1,8 +1,8 @@
 {
-  "version": "1.0.3",
+  "version": "1.1.0",
   "setup_rev": 1,
   "files": {
-    "zaia_pdf.py": "95c70e3d7ae9eb731d633a8464bda6c362a9d3f554736f91c8d3e810353168d2",
+    "zaia_pdf.py": "60c95698c125cc66de607f89402c7630e27f0fd935aa3f8a961ecc2bffdc9b85",
     "zaia.ico": "30202817ab8dd4e90e8d9af8475a582a744382a497bac2acb5b2fffbd78b504a",
     "logo.png": "a5cff9d3445c517af1b36c5e4311047c8d06175369dbb197ef867eef8405bf94",
     "ZAIA_PDF.bat": "e54e52c7a433a1f96b9b145ccc7a0e7e1528be0acb9d80a2852af5d2c221c8ee"

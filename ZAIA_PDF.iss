@@ -1,5 +1,5 @@
 #define AppName "ZAIA PDF"
-#define AppVersion "1.0.3"
+#define AppVersion "1.1.0"
 
 [Setup]
 AppId={{8F3A6C2E-1B7D-4E95-A4C0-5D2E9B7F1A63}
