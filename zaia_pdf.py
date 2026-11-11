@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphi
                                QWidgetAction, QSlider)
 from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 
-APP_VER = "0.9.2"
+APP_VER = "0.9.3"
 APP_NAME = "ZAIA PDF"
 UPDATE_URL = "https://raw.githubusercontent.com/Minos117/-/main/update.json"
 APP_DIR = Path(__file__).resolve().parent
@@ -295,6 +295,7 @@ class Canvas(QGraphicsView):
         self.font = QFont("Tahoma", 16)
         self.tx_stretch = self.tx_line = self.tx_weight = 100
         self.undo, self.redo = [], []
+        self.notes = []
         self.cur = self.start = self.pg = self.erasing = None
         self.timer = QTimer(self, singleShot=True, interval=40)
         self.timer.timeout.connect(self.refresh)
@@ -557,11 +558,34 @@ class Canvas(QGraphicsView):
                 p.setVisible(True)
         return bytes(buf.data()), idxs
 
-    def build(self):
+    def form_hits(self):
+        """number of form fields (date pickers, dropdowns, text boxes...) that added items sit on top of"""
+        self.sc.clearSelection()
+        n = 0
+        rects = {}
+        for it in self.sc.items():
+            if it.data(0) == "ann":
+                i = self.ann_page(it)
+                o = self.pages[i].sceneBoundingRect().topLeft()
+                r = it.sceneBoundingRect().translated(-o)
+                rects.setdefault(i, []).append(fitz.Rect(r.left(), r.top(), r.right(), r.bottom()))
+        for i, rs in rects.items():
+            for w in self.doc[i].widgets():
+                if any(w.rect.intersects(r) for r in rs):
+                    n += 1
+        return n
+
+    def build(self, flatten=False):
+        """flatten=True turns form fields into plain page content so added text always shows ABOVE them
+        (viewers draw live form fields on top of everything else)"""
         ov, idxs = self.overlay_pdf()
         out = fitz.open("pdf", self.data)
         if out.needs_pass:
             out.authenticate(self.password)
+        self.notes = []
+        if flatten and any(True for pg in out if pg.first_widget):
+            out.bake(annots=False, widgets=True)
+            self.notes.append("ทำฟอร์มเป็นข้อความถาวรแล้ว: ช่องกรอก/ปฏิทิน/ดรอปลิสต์ในไฟล์ใหม่จะกรอกต่อไม่ได้ (ไฟล์ต้นฉบับไม่เปลี่ยน)")
         if ov:
             o = fitz.open("pdf", ov)
             for n, i in enumerate(idxs):
@@ -570,17 +594,36 @@ class Canvas(QGraphicsView):
                     pg.show_pdf_page(pg.rect * pg.derotation_matrix, o, n, rotate=pg.rotation)
                 else:
                     pg.show_pdf_page(pg.rect, o, n)
+        if self._strip_xfa(out):
+            self.notes.append("ลบ XFA (ฟอร์มไดนามิกของ Adobe) แล้ว: Adobe จึงแสดงข้อความที่เพิ่มได้ แต่สคริปต์ XFA (เช่น ปฏิทินแบบไดนามิก) อาจใช้ไม่ได้")
         return out
 
-    def save(self, path):
-        out = self.build()
+    @staticmethod
+    def _strip_xfa(out):
+        """Adobe renders dynamic XFA forms from XFA data and ignores page content, so added text would never show"""
+        cat = out.pdf_catalog()
+        t, v = out.xref_get_key(cat, "AcroForm")
+        if t == "xref":
+            af = int(v.split()[0])
+            if out.xref_get_key(af, "XFA")[0] != "null":
+                out.xref_set_key(af, "XFA", "null")
+                out.xref_set_key(cat, "NeedsRendering", "null")
+                return True
+        elif t == "dict" and "/XFA" in v:
+            out.xref_set_key(cat, "AcroForm/XFA", "null")
+            out.xref_set_key(cat, "NeedsRendering", "null")
+            return True
+        return False
+
+    def save(self, path, flatten=False):
+        out = self.build(flatten)
         tmp = path + ".tmp"
         out.save(tmp, garbage=3, deflate=True, encryption=fitz.PDF_ENCRYPT_KEEP)
         out.close()
         os.replace(tmp, path)
 
     def print_to(self, printer, a, b):
-        d = self.build()
+        d = self.build(True)  # printing: fields become plain content so nothing hides the added text
         s = min(printer.resolution(), 300) / 72  # cap dpi: 1200dpi page = hundreds of MB
         painter = None
         for n, i in enumerate(range(a - 1, b)):
@@ -1253,12 +1296,32 @@ class Main(QMainWindow):
                 self, APP_NAME, "เขียนทับไฟล์ต้นฉบับ? ย้อนกลับไม่ได้",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
+        flatten = False
+        hits = self.cv.form_hits()
+        if hits:
+            m = QMessageBox(self)
+            m.setWindowTitle(APP_NAME)
+            m.setIcon(QMessageBox.Question)
+            m.setText("ข้อความที่เพิ่มทับ %d ช่องฟอร์ม (เช่น ปฏิทินเลือกวันที่ / ดรอปลิสต์)" % hits)
+            m.setInformativeText("โปรแกรมอ่าน PDF วาดช่องฟอร์มทับบนสุดเสมอ ข้อความจะถูกบังถ้าไม่ทำฟอร์มเป็นข้อความถาวร\n\n"
+                                 "• ทำเป็นข้อความถาวร (แนะนำ): ข้อความแสดงชัวร์ แต่ช่องกรอกในไฟล์ใหม่จะกรอกต่อไม่ได้\n"
+                                 "• คงช่องกรอกไว้: ยังกรอกต่อได้ แต่ข้อความที่ทับช่องอาจถูกบัง")
+            b1 = m.addButton("ทำเป็นข้อความถาวร (แนะนำ)", QMessageBox.AcceptRole)
+            b2 = m.addButton("คงช่องกรอกไว้", QMessageBox.DestructiveRole)
+            m.addButton("ยกเลิก", QMessageBox.RejectRole)
+            m.exec()
+            if m.clickedButton() is b1:
+                flatten = True
+            elif m.clickedButton() is not b2:
+                return
         try:
-            self.cv.save(f)
+            self.cv.save(f, flatten)
         except Exception as e:
             return QMessageBox.critical(self, APP_NAME, "บันทึกไม่สำเร็จ:\n%s: %s" % (type(e).__name__, e))
         self.dirty = False
         self.statusBar().showMessage("บันทึกแล้ว: " + f, 6000)
+        if self.cv.notes:
+            QMessageBox.information(self, APP_NAME, "บันทึกแล้ว มีข้อสังเกต:\n\n" + "\n".join(self.cv.notes))
 
     def print_pdf(self):
         """print preview (shows exactly what will be printed) -> its Print button opens the printer dialog"""
